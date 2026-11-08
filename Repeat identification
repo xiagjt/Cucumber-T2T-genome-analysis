@@ -99,22 +99,6 @@ RepeatMasker \
 
 Additional intermediate files may be produced. Retain the custom library with the annotations to preserve the basis of the repeat calls.
 
-## 5. Masking for downstream gene annotation
-
-The supplied command does **not** request soft masking. If a lowercase repeat-masked genome is needed for gene annotation, add `-xsmall` in a separate run:
-
-```bash
-RepeatMasker \
-    -lib CG64-families.fa \
-    -pa 30 \
-    -html \
-    -gff \
-    -xsmall \
-    -dir Masker.softmask.out \
-    CG64.Nuclear.Add.fa
-```
-
-This is an optional adaptation, not part of the supplied command. Its `.masked` FASTA represents repeat regions in lowercase.
 
 ## Documentation
 
