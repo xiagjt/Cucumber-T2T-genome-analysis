@@ -1,0 +1,281 @@
+# Selection Scans Using Nucleotide Diversity, XP-CLR and FST
+
+**Complete scripts for three window-based population-genomic scans in cucumber.**
+
+## Overview
+
+| Method | Ranking statistic | Candidate windows | Final processing |
+| :--- | :--- | :--- | :--- |
+| Nucleotide diversity ratio | π(wild) / π(domesticated) | Highest 5% | Retain windows with ≥5 counted variants; merge touching/overlapping windows |
+| XP-CLR | Raw XP-CLR score | Highest 5% | Variant-count filter, merging and gene overlap |
+| FST | Weighted Weir–Cockerham FST | Highest 5% | Variant-count filter, merging and gene overlap |
+
+All three use 20-kb windows and 2-kb steps. The 5% cutoff is an empirical ranking rule, not a significance level or FDR estimate. The scripts produce separate candidate sets; they do not calculate their intersection or a combined selection score.
+
+**Code preservation:** the scripts below retain the supplied code, including the original column references and parameter values. Explanatory notes outside the code blocks do not modify the implementation.
+
+## Requirements and inputs
+
+Use Bash 4+ for associative arrays, VCFtools, BCFtools, BEDTools, the Python implementation of `xpclr` matching these options, and standard Unix text-processing tools.
+
+| Input | Role |
+| :--- | :--- |
+| `Variants.Genome.SNP.Maf0.05Miss0.5.imputed.vcf.gz` | π/FST calculation and XP-CLR post-filter variant counting |
+| `GATK.Merged.AllChr.SNP.Filter.Miss0.5.Maf0.05.imputed.vcf.gz` | XP-CLR calculation and π/FST post-filter variant counting |
+| `pop_wild.txt` | Wild sample IDs, one per line |
+| `pop_dom.txt` | Domesticated sample IDs, one per line |
+| `HW64.final_annotation_results.txt` | Headered tab-delimited annotation table used by XP-CLR/FST scripts |
+
+The annotation extraction assumes chromosome, start and end are columns 2, 3 and 4, respectively, with 1-based inclusive gene coordinates. It retains the complete original rows for overlapping genes. Statistical inputs use chromosome labels such as `1`, whereas annotation overlap adds `Chr` to produce `Chr1`; adapt this rule if your naming differs.
+
+The two VCF filenames are distinct. Confirm their reference coordinates, variant sets and filtering history. Counting variants in one file after computing statistics from the other is not automatically equivalent to counting the variants actually used in each test. Population membership is determined by the sample lists, not their filenames; record the actual accessions and group sizes.
+
+## 1. Nucleotide diversity ratio
+
+Save as `selection_pi.sh`.
+
+```bash
+#!/bin/bash
+set -euo pipefail
+
+# Calculate genome-wide nucleotide diversity (Pi) for wild and domesticated populations
+vcftools --gzvcf Variants.Genome.SNP.Maf0.05Miss0.5.imputed.vcf.gz --keep pop_wild.txt --window-pi 20000 --window-pi-step 2000 --out Variants.Genome.SNP.Maf0.05Miss0.5_Wild_Pi
+vcftools --gzvcf Variants.Genome.SNP.Maf0.05Miss0.5.imputed.vcf.gz --keep pop_dom.txt --window-pi 20000 --window-pi-step 2000 --out Variants.Genome.SNP.Maf0.05Miss0.5_Dom_Pi
+
+# Define inputs and prefix
+WILD_PI="Variants.Genome.SNP.Maf0.05Miss0.5_Wild_Pi.windowed.pi"
+DOM_PI="Variants.Genome.SNP.Maf0.05Miss0.5_Dom_Pi.windowed.pi"
+VCF_FILE="GATK.Merged.AllChr.SNP.Filter.Miss0.5.Maf0.05.imputed.vcf.gz"
+PREFIX="Pi_Selection"
+
+# Match Pi windows, calculate Pi ratio (Wild/Dom), and handle zero division compactly
+awk -F'\t' -v OFS='\t' 'NR==FNR {if(NR>1 && $6!="NaN") d[$1 FS $2 FS $3]=$6; next} FNR>1 && $6!="NaN" && (($1 FS $2 FS $3) in d) {w=$6; dom=d[$1 FS $2 FS $3]; r=(w==0&&dom==0)?0:(dom==0?w/1e-8:w/dom); print $1, $2, $3, w, dom, r}' "${DOM_PI}" "${WILD_PI}" > "${PREFIX}_Matched_Temp.txt"
+
+echo -e "CHROM\tBIN_START\tBIN_END\tPI_WILD\tPI_DOM\tPI_RATIO" > "${PREFIX}_Matched_All.txt"
+cat "${PREFIX}_Matched_Temp.txt" >> "${PREFIX}_Matched_All.txt"
+
+# Extract top 5% Pi ratio windows
+TOTAL_LINES=$(tail -n +2 "${PREFIX}_Matched_All.txt" | wc -l)
+TOP5_NUM=$(awk "BEGIN {print int(${TOTAL_LINES} * 0.05)}")
+echo -e "CHROM\tBIN_START\tBIN_END\tPI_WILD\tPI_DOM\tPI_RATIO" > "${PREFIX}_Top5_Regions.txt"
+tail -n +2 "${PREFIX}_Matched_All.txt" | sort -k6,6nr | awk -v limit="${TOP5_NUM}" 'NR<=limit {print $0}' >> "${PREFIX}_Top5_Regions.txt"
+
+# Convert to BED format (0-based) and retain windows with >= 5 SNPs
+tail -n +2 "${PREFIX}_Top5_Regions.txt" | awk -v OFS='\t' '{print $1, $2-1, $3, $6}' > "${PREFIX}_Top5.bed"
+bedtools intersect -a "${PREFIX}_Top5.bed" -b "${VCF_FILE}" -c > "${PREFIX}_Top5_SNPCount.bed"
+awk '$5 >= 5' "${PREFIX}_Top5_SNPCount.bed" > "${PREFIX}_Top5_Filtered_SNP5.bed"
+
+# Merge overlapping/adjacent windows and format final output
+bedtools sort -i "${PREFIX}_Top5_Filtered_SNP5.bed" | bedtools merge -i - -d 0 -c 4,5 -o max,sum > "${PREFIX}_Final_Merged.bed"
+echo -e "CHROM\tBIN_START\tBIN_END\tMAX_PI_RATIO\tTOTAL_SNPS" > "${PREFIX}_Final_Selection_Result.txt"
+awk -F'\t' -v OFS='\t' '{print $1, $2+1, $3, $4, $5}' "${PREFIX}_Final_Merged.bed" >> "${PREFIX}_Final_Selection_Result.txt"
+
+# Clean up temporary files
+rm "${PREFIX}_Matched_Temp.txt" "${PREFIX}_Top5.bed" "${PREFIX}_Top5_SNPCount.bed" "${PREFIX}_Top5_Filtered_SNP5.bed" "${PREFIX}_Final_Merged.bed"
+```
+
+Matched windows are joined by chromosome/start/end. The supplied zero handling is retained: both π values equal to zero gives ratio zero; a zero domesticated value with nonzero wild π uses `1e-8` as the denominator. This is a numerical convention, not an observed diversity estimate.
+
+The script filters the top-ranked windows by variant count **after** selecting the top 5%; it does not select the top 5% anew among all count-eligible windows. No gene-overlap step is included for π in the supplied implementation.
+
+## 2. XP-CLR
+
+Save as `selection_xpclr.sh`. The implementation scans chromosomes in 5-Mb computational blocks, with up to 20 simultaneous processes; the statistical window is still 20 kb.
+
+```bash
+#!/bin/bash
+set -euo pipefail
+
+# Define variables
+VCF_GATK="GATK.Merged.AllChr.SNP.Filter.Miss0.5.Maf0.05.imputed.vcf.gz"
+VCF_VAR="Variants.Genome.SNP.Maf0.05Miss0.5.imputed.vcf.gz"
+REF_RAW="pop_dom.txt"
+REF_CLEAN="pop_dom_clean.txt"
+TARGET="pop_wild.txt"
+ANNO_FILE="HW64.final_annotation_results.txt"
+XPCLR_OUTDIR="xpclr_results_dom.wild"
+PREFIX="XPCLR_Selection"
+
+mkdir -p "${XPCLR_OUTDIR}"
+
+# Filter valid samples for XP-CLR
+bcftools query -l "${VCF_GATK}" > vcf.samples
+grep -Fxf vcf.samples "${REF_RAW}" > "${REF_CLEAN}"
+
+# Run XP-CLR in parallel by 5Mb windows across chromosomes
+declare -A chr_length=([1]=41854222 [2]=51424094 [3]=46702804 [4]=49415022 [5]=37726087 [6]=38225442 [7]=30380331)
+BLOCK_SIZE=5000000
+MAX_JOBS=20
+
+for chr in {1..7}; do
+    len=${chr_length[$chr]}
+    for start in $(seq 1 $BLOCK_SIZE $len); do
+        end=$((start + BLOCK_SIZE - 1))
+        [ $end -gt $len ] && end=$len
+        outfile="${XPCLR_OUTDIR}/xpclr.chr${chr}.${start}_${end}.out"
+
+        xpclr --input "${VCF_GATK}" --samplesA "${REF_CLEAN}" --samplesB "${TARGET}" \
+            --minsnps 5 --maxsnps 10000 --size 20000 --step 2000 --ld 0.95 \
+            --chr "${chr}" --start "${start}" --stop "${end}" --out "${outfile}" > "${outfile}.log" 2>&1 &
+
+        while [ $(jobs -r | wc -l) -ge $MAX_JOBS ]; do sleep 5; done
+    done
+done
+wait
+
+# Merge XP-CLR results
+for chr in {1..7}; do
+    files=$(ls ${XPCLR_OUTDIR}/xpclr.chr${chr}.*.out 2>/dev/null | sort -V)
+    if [ -n "$files" ]; then
+        first=$(echo $files | awk '{print $1}')
+        head -n 1 "$first" > "${XPCLR_OUTDIR}/xpclr.chr${chr}.merged.txt"
+        for f in $files; do tail -n +2 "$f" >> "${XPCLR_OUTDIR}/xpclr.chr${chr}.merged.txt"; done
+    fi
+done
+awk 'FNR==1 && NR!=1 {next} {print}' ${XPCLR_OUTDIR}/xpclr.chr*.merged.txt > xpcrl.merged.txt
+
+# Extract top 5% XP-CLR windows
+VALID_LINES=$(awk -F'\t' '$12 != "" && $12 != "NaN" && NR>1' xpcrl.merged.txt | wc -l)
+TOP5_NUM=$(awk "BEGIN {print int(${VALID_LINES} * 0.05)}")
+awk -F'\t' '$12 != "" && $12 != "NaN" && NR>1' xpcrl.merged.txt | sort -t$'\t' -k12,12nr | awk -v limit="${TOP5_NUM}" 'NR<=limit' | \
+    awk -F'\t' -v OFS='\t' '{print $2, $3-1, $4, $12}' > "${PREFIX}_Top5_Temp.bed"
+
+# Retain windows with >= 5 SNPs and merge overlapping/adjacent blocks
+bedtools intersect -a "${PREFIX}_Top5_Temp.bed" -b "${VCF_VAR}" -c | awk '$5 >= 5' | bedtools sort -i - | \
+    bedtools merge -i - -d 0 -c 4,5 -o max,sum > "${PREFIX}_Final_Merged_Blocks.bed"
+
+# Format block output
+echo -e "CHROM\tBLOCK_START\tBLOCK_END\tMAX_XPCLR_SCORE\tTOTAL_SNPS" > "${PREFIX}_Final_Regions.txt"
+awk -F'\t' -v OFS='\t' '{print $1, $2+1, $3, $4, $5}' "${PREFIX}_Final_Merged_Blocks.bed" >> "${PREFIX}_Final_Regions.txt"
+
+# Extract candidate genes matching the regions
+awk -F'\t' -v OFS='\t' '{print "Chr"$1, $2, $3}' "${PREFIX}_Final_Merged_Blocks.bed" > xpclr_blocks_renamed.bed
+tail -n +2 "${ANNO_FILE}" | awk -F'\t' -v OFS='\t' '{print $2, $3-1, $4, $0}' > anno_temp.bed
+bedtools intersect -a anno_temp.bed -b xpclr_blocks_renamed.bed -wa | sort | uniq > xpclr_intersected_genes.bed
+
+# Format candidate gene output
+head -n 1 "${ANNO_FILE}" > "${PREFIX}_Candidate_Genes.txt"
+cut -f 4- xpclr_intersected_genes.bed >> "${PREFIX}_Candidate_Genes.txt"
+
+# Clean up temporary files
+rm vcf.samples "${PREFIX}_Top5_Temp.bed" "${PREFIX}_Final_Merged_Blocks.bed" xpclr_blocks_renamed.bed anno_temp.bed xpclr_intersected_genes.bed
+```
+
+### XP-CLR settings
+
+| Setting | Supplied value |
+| :--- | :--- |
+| Population A | Domesticated samples retained from `pop_dom.txt` |
+| Population B | `pop_wild.txt` |
+| Statistical window | `20000 bp` |
+| Step | `2000 bp` |
+| Minimum / maximum SNPs | `5` / `10000` |
+| LD setting | `0.95` |
+| Computational block size | `5000000 bp` |
+| Concurrent processes | Up to `20` |
+| Ranked output field | Column `12`, expected raw `xpclr` |
+
+The variable names `REF_*` and `TARGET` do not establish XP-CLR direction; the actual assignments are A = domesticated and B = wild. The developer's clarified convention identifies A as the object population and B as the reference; verify this against the exact installed implementation rather than swapping samples based on the shell variable names.
+
+Inspect the XP-CLR header before use: this code expects chromosome/start/stop in columns 2–4 and raw score in column 12. It does not rank normalized `xpclr_norm`. The retained filename `xpcrl.merged.txt` contains the original spelling.
+
+## 3. FST
+
+Save as `selection_fst.sh`.
+
+```bash
+#!/bin/bash
+set -euo pipefail
+
+# Calculate genome-wide FST
+vcftools --gzvcf Variants.Genome.SNP.Maf0.05Miss0.5.imputed.vcf.gz \
+    --weir-fst-pop pop_wild.txt \
+    --weir-fst-pop pop_dom.txt \
+    --fst-window-size 20000 \
+    --fst-window-step 2000 \
+    --out Variants.Genome.SNP.Maf0.05Miss0.5_Fst
+
+# Define inputs and prefix
+FST_FILE="Variants.Genome.SNP.Maf0.05Miss0.5_Fst.windowed.weir.fst"
+VCF_FILE="GATK.Merged.AllChr.SNP.Filter.Miss0.5.Maf0.05.imputed.vcf.gz"
+ANNO_FILE="HW64.final_annotation_results.txt"
+PREFIX="FST_Selection"
+
+# Extract top 5% FST windows
+VALID_LINES=$(awk '$5 != "NaN" && NR>1' "${FST_FILE}" | wc -l)
+TOP5_NUM=$(awk "BEGIN {print int(${VALID_LINES} * 0.05)}")
+awk '$5 != "NaN" && NR>1' "${FST_FILE}" | sort -k5,5nr | awk -v limit="${TOP5_NUM}" 'NR<=limit' | \
+    awk -v OFS='\t' '{print $1, $2-1, $3, $5}' > "${PREFIX}_Top5_Temp.bed"
+
+# Retain windows with >= 5 SNPs
+bedtools intersect -a "${PREFIX}_Top5_Temp.bed" -b "${VCF_FILE}" -c > "${PREFIX}_Top5_SNPCount.bed"
+awk '$5 >= 5' "${PREFIX}_Top5_SNPCount.bed" > "${PREFIX}_Top5_Filtered.bed"
+
+# Merge overlapping/adjacent windows and format output
+bedtools sort -i "${PREFIX}_Top5_Filtered.bed" | \
+    bedtools merge -i - -d 0 -c 4,5 -o max,sum > "${PREFIX}_Final_Merged_Blocks.bed"
+echo -e "CHROM\tBLOCK_START\tBLOCK_END\tMAX_WEIGHTED_FST\tTOTAL_SNPS" > "${PREFIX}_Final_Regions.txt"
+awk -F'\t' -v OFS='\t' '{print $1, $2+1, $3, $4, $5}' "${PREFIX}_Final_Merged_Blocks.bed" >> "${PREFIX}_Final_Regions.txt"
+
+# Extract candidate genes matching the regions
+awk -F'\t' -v OFS='\t' '{print "Chr"$1, $2, $3}' "${PREFIX}_Final_Merged_Blocks.bed" > fst_blocks_renamed.bed
+tail -n +2 "${ANNO_FILE}" | awk -F'\t' -v OFS='\t' '{print $2, $3-1, $4, $0}' > anno_temp.bed
+bedtools intersect -a anno_temp.bed -b fst_blocks_renamed.bed -wa | sort | uniq > fst_intersected_genes.bed
+
+# Format candidate gene output
+head -n 1 "${ANNO_FILE}" > "${PREFIX}_Candidate_Genes.txt"
+cut -f 4- fst_intersected_genes.bed >> "${PREFIX}_Candidate_Genes.txt"
+
+# Clean up temporary files
+rm "${PREFIX}_Top5_Temp.bed" "${PREFIX}_Top5_SNPCount.bed" "${PREFIX}_Top5_Filtered.bed" "${PREFIX}_Final_Merged_Blocks.bed"
+rm fst_blocks_renamed.bed anno_temp.bed fst_intersected_genes.bed
+```
+
+This code ranks column 5, expected `WEIGHTED_FST`, rather than column 6 (`MEAN_FST`). FST measures differentiation and is not directional; a high value alone does not identify which population experienced selection.
+
+## Running the scripts
+
+Run from a directory containing the inputs. Execute sequentially if sharing the same working directory, because XP-CLR and FST both use `anno_temp.bed`.
+
+```bash
+bash selection_pi.sh > selection_pi.log 2>&1
+bash selection_xpclr.sh > selection_xpclr.log 2>&1
+bash selection_fst.sh > selection_fst.log 2>&1
+```
+
+## Main retained outputs
+
+| Method | File | Contents |
+| :--- | :--- | :--- |
+| π | `Pi_Selection_Matched_All.txt` | Matched population π values and ratios |
+| π | `Pi_Selection_Top5_Regions.txt` | Top-ranked windows before the additional SNP-count filter |
+| π | `Pi_Selection_Final_Selection_Result.txt` | Merged candidates and maximum ratio |
+| XP-CLR | `xpclr_results_dom.wild/` | Per-block scans, logs and per-chromosome merged results |
+| XP-CLR | `xpcrl.merged.txt` | Combined scan table |
+| XP-CLR | `XPCLR_Selection_Final_Regions.txt` | Merged candidates and maximum raw score |
+| XP-CLR | `XPCLR_Selection_Candidate_Genes.txt` | Original annotation rows overlapping candidates |
+| FST | `FST_Selection_Final_Regions.txt` | Merged candidates and maximum weighted FST |
+| FST | `FST_Selection_Candidate_Genes.txt` | Original annotation rows overlapping candidates |
+
+VCFtools statistic files and logs are also retained. The scripts remove the merged BED files after writing the final tables.
+
+## Interpretation and implementation notes
+
+- **SNP counts:** `bedtools merge -c 4,5 -o max,sum` retains the maximum constituent-window score and sums per-window counts. With overlapping windows, `TOTAL_SNPS` is a sum of window counts with repeated contributions, not the number of unique SNPs in the merged interval. Recount variants against the merged intervals if unique counts are needed.
+- **Ranking:** `int(N × 0.05)` rounds down and can select zero windows when fewer than 20 pass the initial validity checks. Ties at the cutoff are truncated. Post-ranking SNP filtering can leave fewer than 5% of windows.
+- **Validity filters:** the scripts check the literal string `NaN`; they do not comprehensively reject every nonfinite or malformed value. Confirm the actual missing-value notation and file schemas.
+- **Coordinates:** the code subtracts one from starts for BED and adds one back in final tables. This assumes the source start positions are 1-based inclusive. Verify XP-CLR's coordinate convention in the installed version, especially near chromosome starts and 5-Mb block boundaries. BED end coordinates are half-open.
+- **XP-CLR blocks:** verify the hard-coded chromosome lengths against the analysis reference. No boundary padding or duplicate-window reconciliation is implemented; inspect window coverage near block joins. Bare `wait` does not individually validate every background job, so review all logs and expected outputs before ranking the merged scan.
+- **Sample filtering:** only the domesticated XP-CLR list is intersected with VCF samples. Validate both groups, their membership and their nonempty sizes before scanning.
+- **Candidate genes:** XP-CLR/FST extract genes with any interval overlap; no minimum fraction or promoter extension is requested. π has no corresponding gene extraction in this implementation.
+- **Biological scope:** high-rank windows are candidate signals. Demography, recombination, imputation and variant ascertainment can influence them. The MAF/missingness labels in filenames do not independently establish the filtering actually applied, and a common-SNP panel affects interpretation of nucleotide diversity.
+
+## References and validation
+
+- [VCFtools manual](https://vcftools.github.io/man_latest.html)
+- [VCFtools windowed π output discussion](https://github.com/vcftools/vcftools/issues/85)
+- [XP-CLR implementation](https://github.com/hardingnj/xpclr)
+- [XP-CLR population-direction clarification](https://github.com/hardingnj/xpclr/issues/34)
+- [BEDTools](https://bedtools.readthedocs.io/)
+
+The Bash blocks were checked for syntax only. The supplied code has not been altered to address the implementation notes. Population datasets and external tool runs were not available for a biological validation run.
