@@ -1,0 +1,161 @@
+# Satellite Repeat and 45S rDNA Identification
+
+**Assembly-based satellite repeat discovery with SRF and rRNA gene prediction with Barrnap.**
+
+## Overview
+
+| Analysis | Input in the supplied example | Main tools | Output |
+| :--- | :--- | :--- | :--- |
+| Satellite repeat discovery | `CLv5.T2T.fa` | KMC, SRF | Reconstructed satellite sequences |
+| Satellite localization and abundance | SRF sequences and `HW64.T2T.fa` | minimap2, SRF utilities | Genomic intervals and abundance summary |
+| 45S-associated rRNA gene prediction | `CLv5.T2T.fa` | Barrnap | Predicted rRNA features in GFF format |
+
+The commands retain the supplied filenames, paths and analysis parameters. Comment markers have been removed from the first four commands so that the entire satellite workflow can be run in sequence. Creation of the KMC temporary directory has been added.
+
+## 1. Satellite repeat identification
+
+Here, SRF means **Satellite Repeat Finder**. This analysis targets satellite DNA rather than providing a conventional microsatellite/simple sequence repeat (SSR) marker scan.
+
+### 1.1 Requirements
+
+- KMC and `kmc_dump`.
+- SRF and its `srfutils.js` companion script.
+- The k8 JavaScript engine required by the SRF utilities.
+- minimap2.
+
+Run the following blocks in the same working directory, with both genome FASTA files available. Update the SRF installation paths if necessary.
+
+### 1.2 Count high-frequency k-mers
+
+```bash
+mkdir -p tmp_dir
+
+kmc \
+    -fm \
+    -k151 \
+    -t60 \
+    -ci20 \
+    -cs100000 \
+    CLv5.T2T.fa \
+    count.kmc \
+    tmp_dir
+
+kmc_dump count.kmc count.txt
+```
+
+| Setting | Value | Description |
+| :--- | :--- | :--- |
+| `-fm` | Enabled | Multi-line FASTA input |
+| `-k` | `151` | K-mer length |
+| `-t` | `60` | Threads |
+| `-ci` | `20` | Minimum k-mer occurrence count retained |
+| `-cs` | `100000` | Maximum counter value stored |
+| Database prefix | `count.kmc` | Binary count database |
+
+The occurrence threshold applies to the input assembly, rather than sequencing-read coverage. `-cs100000` caps stored counts; it is not an upper-frequency exclusion threshold.
+
+### 1.3 Reconstruct and extend satellite sequences
+
+```bash
+/home/GuanJianTao/Software/srf-master/srf \
+    -p prefix \
+    count.txt \
+    > srf.fa
+
+/home/GuanJianTao/Software/srf-master/srfutils.js \
+    enlong srf.fa \
+    > srf.enlong.fa
+```
+
+SRF reconstructs candidate satellite sequences from the k-mer counts. `-p prefix` sets the sequence-name prefix. The `enlong` utility extends short sequences for alignment; `enlong` is the actual subcommand spelling.
+
+### 1.4 Align against the genome being analyzed
+
+```bash
+minimap2 \
+    -c \
+    -N1000000 \
+    -f1000 \
+    -r100,100 \
+    -t60 \
+    srf.enlong.fa \
+    HW64.T2T.fa \
+    > srf.paf
+```
+
+| Parameter | Value | Description |
+| :--- | :--- | :--- |
+| `-c` | Enabled | Include alignment CIGAR strings in PAF |
+| `-N` | `1000000` | Maximum secondary alignments retained |
+| `-f` | `1000` | Integer minimizer-occurrence threshold |
+| `-r` | `100,100` | Chaining/alignment bandwidth settings |
+| `-t` | `60` | Threads |
+
+In minimap2 syntax, `srf.enlong.fa` is the **target/indexed sequence set** and `HW64.T2T.fa` is the **query**. Retain this order for the supplied SRF post-processing workflow; the genome coordinates are on the query side of the PAF.
+
+### 1.5 Extract intervals and summarize abundance
+
+```bash
+/home/GuanJianTao/Software/srf-master/srfutils.js \
+    paf2bed srf.paf \
+    > srf.bed
+
+/home/GuanJianTao/Software/srf-master/srfutils.js \
+    bed2abun srf.bed \
+    > srf.abun
+```
+
+`paf2bed` filters and resolves overlapping assignments using the SRF utility's rules. `bed2abun` summarizes the assigned intervals by repeat sequence. For assembly input, interpret abundance as represented genomic sequence, rather than automatically as an exact count of repeat monomers.
+
+### 1.6 Outputs and comparison design
+
+| File | Contents |
+| :--- | :--- |
+| `count.txt` | K-mer sequences and counts |
+| `srf.fa` | Reconstructed candidate satellite sequences |
+| `srf.enlong.fa` | Extended sequences used for mapping |
+| `srf.paf` | Alignments to the satellite sequence set |
+| `srf.bed` | Assigned intervals in the analyzed genome |
+| `srf.abun` | Abundance summary |
+
+The supplied example discovers candidates in **CLv5** and measures their representation in **HW64**. It therefore does not independently discover HW64-specific repeats. For within-genome discovery and localization, use the same genome in the KMC and minimap2 steps. For comparisons, document the library's source and use a consistent repeat set and mapping procedure across genomes; independent discovery in each accession can help identify accession-specific candidates.
+
+SRF candidates may require family clustering and inspection for multimeric or higher-order repeat sequences before biological comparisons.
+
+## 2. Identification of 45S-associated rRNA genes
+
+### 2.1 Run Barrnap
+
+The supplied command predicts rRNA features in CLv5 using eukaryotic models:
+
+```bash
+barrnap \
+    --threads 20 \
+    --kingdom euk \
+    ../../../assembly.dir/CLv5.T2T.fa \
+    > CLv5.45S.gff
+```
+
+| Argument | Value | Description |
+| :--- | :--- | :--- |
+| `--threads` | `20` | Threads |
+| `--kingdom` | `euk` | Eukaryotic prediction models |
+| Genome FASTA | `../../../assembly.dir/CLv5.T2T.fa` | Input assembly; path relative to the working directory |
+| Standard output | `CLv5.45S.gff` | Predicted rRNA features |
+
+Use a Barrnap version supporting these options and record its version. The filename `CLv5.45S.gff` is retained from the supplied command; the filename itself does not restrict predictions to 45S components.
+
+### 2.2 Interpret the predictions
+
+The 45S rDNA transcription unit contains the **18S, 5.8S and large-subunit rRNA genes**; plant large-subunit rRNA is commonly termed 25S, while Barrnap's eukaryotic model labels it `28S_rRNA`. Eukaryotic Barrnap predictions can also include 5S rRNA, which should be distinguished from the 45S components.
+
+Barrnap reports individual rRNA gene features. Its output alone does not define complete 45S repeat units, internal/intergenic spacer boundaries, tandem-array boundaries or exact full-unit copy numbers. Use the gene predictions as landmarks for subsequent array characterization.
+
+## References and reproducibility
+
+- [SRF](https://github.com/lh3/srf)
+- [KMC](https://github.com/refresh-bio/KMC)
+- [minimap2 manual](https://lh3.github.io/minimap2/minimap2.html)
+- [Barrnap](https://github.com/tseemann/barrnap)
+
+Keep the software versions, input assembly versions and satellite library with the results. These commands have been formatted and checked for Bash syntax; they have not been executed on the biological datasets during preparation of this document.
