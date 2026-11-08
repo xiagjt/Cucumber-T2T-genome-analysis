@@ -1,0 +1,157 @@
+# CENH3 ChIP-seq Analysis
+
+**From paired-end sequencing reads to candidate CENH3-enriched genomic intervals.**
+
+[Repository home](../README.md) · [Shell script](pipeline.sh)
+
+## Overview
+
+The workflow applies fastp, aligns reads to a T2T assembly with Bowtie2, processes BAM files, and compares CENH3 ChIP-seq with an input control using deepTools. Enriched 5-kb bins are joined into candidate domains.
+
+The supplied [pipeline.sh](pipeline.sh) is an original command template. The configured example below resolves path variables and corrects the sorting order before duplicate marking; it is an adapted example, not a record of changes already applied to the script.
+
+## Requirements
+
+| Software | Role |
+| :--- | :--- |
+| fastp | Paired-end read quality control |
+| Bowtie2 | Reference indexing and read alignment |
+| SAMtools | BAM conversion, coordinate sorting, filtering and indexing |
+| Sambamba | Duplicate marking |
+| deepTools (`bamCompare`) | ChIP/input signal comparison |
+| BEDTools | Merging enriched intervals |
+| Bash, awk | Workflow execution and filtering |
+
+Use the versions employed in the study and record them with the results; versions were not provided with the original script.
+
+## Inputs
+
+| Input | Description |
+| :--- | :--- |
+| `genome.fa` | T2T reference assembly |
+| `CENH3_R1.fq.gz`, `CENH3_R2.fq.gz` | Paired-end ChIP-seq reads |
+| `Input_R1.fq.gz`, `Input_R2.fq.gz` | Matched input-control reads |
+
+Map ChIP and input to the same assembly and process both with the same settings. The example covers one ChIP/input pair; the supplied script does not define replicate handling.
+
+## Before running
+
+| Original detail | Required clarification or adjustment |
+| :--- | :--- |
+| Variables including `$input_dir`, `$sam`, `$index`, `$output` and `$bed` are undefined | Set explicit paths before execution. `$output` and `$output_dir` must refer to the intended locations. |
+| Bowtie2 uses `$fq1` and `$fq2` after fastp | Point alignment at the filtered FASTQs if QC-filtered reads are intended. |
+| `samtools sort -n` precedes `sambamba markdup` | Use a coordinate-sorted BAM for this duplicate-marking step. |
+| Both fastp and Bowtie2 write `$bn.txt` | Give each step a separate log to prevent overwriting. |
+| `bamCompare` writes to `$output_dir`, but the next command reads from `$input_dir` | Use the actual output bedGraph path in the filtering step. |
+
+## Configured command example
+
+Run the following blocks in one Bash session from a dedicated analysis directory. Replace the absolute paths with your own data paths.
+
+### 1. Set paths and build the index
+
+```bash
+set -euo pipefail
+export LC_ALL=C
+
+genome=/absolute/path/genome.fa
+reads=/absolute/path/reads
+out="$PWD/cenh3_results"
+threads=20
+mkdir -p "$out/index" "$out/qc" "$out/bam" "$out/tracks"
+
+bowtie2-build "$genome" "$out/index/genome"
+```
+
+### 2. Process ChIP and input libraries
+
+```bash
+for sample in CENH3 Input; do
+    fastp \
+        -i "$reads/${sample}_R1.fq.gz" \
+        -I "$reads/${sample}_R2.fq.gz" \
+        -o "$out/qc/${sample}_R1.fq.gz" \
+        -O "$out/qc/${sample}_R2.fq.gz" \
+        --html "$out/qc/${sample}.fastp.html" \
+        --json "$out/qc/${sample}.fastp.json" \
+        > "$out/qc/${sample}.fastp.log" 2>&1
+
+    bowtie2 -p "$threads" -x "$out/index/genome" \
+        -1 "$out/qc/${sample}_R1.fq.gz" \
+        -2 "$out/qc/${sample}_R2.fq.gz" \
+        -X 2000 --very-sensitive \
+        -S "$out/bam/${sample}.sam" \
+        2> "$out/bam/${sample}.bowtie2.log"
+
+    samtools view -bh -@ "$threads" "$out/bam/${sample}.sam" \
+        | samtools sort -@ "$threads" \
+            -o "$out/bam/${sample}.sorted.bam" -
+
+    sambamba markdup -t "$threads" \
+        "$out/bam/${sample}.sorted.bam" \
+        "$out/bam/${sample}.marked.bam"
+
+    samtools view -F 1804 -f 2 -b -@ "$threads" \
+        "$out/bam/${sample}.marked.bam" \
+        -o "$out/bam/${sample}.filtered.bam"
+
+    samtools sort -@ "$threads" \
+        "$out/bam/${sample}.filtered.bam" \
+        -o "$out/bam/${sample}.final.bam"
+    samtools index "$out/bam/${sample}.final.bam"
+done
+```
+
+### 3. Compare signal and merge enriched bins
+
+```bash
+bamCompare \
+    -b1 "$out/bam/CENH3.final.bam" \
+    -b2 "$out/bam/Input.final.bam" \
+    -p 12 -bs 5000 \
+    --minMappingQuality 20 --ignoreDuplicates \
+    --normalizeUsing RPKM --scaleFactorsMethod None \
+    --operation log2 \
+    -of bedgraph \
+    -o "$out/tracks/CENH3_vs_Input.log2.bedgraph"
+
+awk '$4 > 2' "$out/tracks/CENH3_vs_Input.log2.bedgraph" \
+    | sort -k1,1 -k2,2n \
+    | bedtools merge -i - -d 200000 -c 4 -o mean \
+    > "$out/tracks/CENH3_enriched_domains.bed"
+```
+
+`--operation log2` makes the original default explicit. This example also adds output sorting and separate QC reports; it has not been run on the study data.
+
+## Key settings
+
+| Setting | Value | Meaning |
+| :--- | :--- | :--- |
+| Bowtie2 `-X` | `2000` | Maximum fragment length for concordant paired-end alignment |
+| SAMtools `-f` | `2` | Require the properly paired flag |
+| SAMtools `-F` | `1804` | Exclude flags for unmapped read/mate, secondary alignment, QC failure and duplicate; supplementary alignments are not explicitly excluded |
+| Minimum mapping quality | `20` | Applied during signal generation |
+| Bin size | `5000 bp` | Signal resolution |
+| Normalization | `RPKM` | Normalize each library before comparison |
+| Enrichment threshold | `score > 2` | Threshold on the log₂ comparison, not on raw RPKM |
+| Merge distance | `200000 bp` | Join selected bins separated by at most 200 kb |
+
+## Outputs and interpretation
+
+| Output | Description |
+| :--- | :--- |
+| `qc/*.fastp.*` | QC reports and logs from the adapted example |
+| `bam/*.final.bam` and `.bai` | Filtered, coordinate-sorted alignments and indexes |
+| `CENH3_vs_Input.log2.bedgraph` | Binned comparison of normalized ChIP and input signal |
+| `CENH3_enriched_domains.bed` | Merged intervals; column 4 is the mean of contributing selected-bin scores |
+
+The comparison uses deepTools pseudocount handling. A score above 2 describes a greater-than-four ratio after that handling, rather than an exact raw coverage ratio. The final intervals can include intervening low-signal gaps because of the 200-kb merge distance; their mean scores summarize selected bins, not every base in the full interval.
+
+These are candidate CENH3-enriched domains. The workflow does not include statistical peak calling, replicate concordance analysis, or a validated procedure for exact centromere boundaries. MAPQ filtering can also reduce representation of repetitive centromeric sequence. Report these settings when comparing domain sizes across assemblies.
+
+## Documentation
+
+- [deepTools bamCompare](https://deeptools.readthedocs.io/en/develop/content/tools/bamCompare.html)
+- [Sambamba](https://github.com/biod/sambamba)
+- [SAMtools view](https://www.htslib.org/doc/samtools-view.html)
+- [BEDTools merge](https://bedtools.readthedocs.io/en/latest/content/tools/merge.html)
