@@ -1,0 +1,195 @@
+# ICA-Based Coexpression Module Analysis
+
+**Identify signed gene modules from expression data using independent component analysis and expression-coherence refinement.**
+
+## Overview
+
+The supplied R script runs `picaplot::runICA()` on a log-transformed expression matrix, assigns genes to the positive or negative tail of their dominant component, and refines these modules using gene–module correlations (`kME`). Each gene is assigned to at most one final module; genes failing the criteria remain `Unassigned`.
+
+This workflow identifies modules and their expression profiles. It does not calculate a gene–gene adjacency matrix, export a network edge list, or perform module–trait association tests.
+
+## 1. Requirements
+
+| Requirement | Description |
+| :--- | :--- |
+| R / `Rscript` | Execute the analysis |
+| `picaplot` and its dependencies | Provide `runICA()` |
+| `strategy2_ica_script.R` | Supplied analysis script |
+| Expression matrix | Tab-delimited gene-by-sample expression values |
+
+Ensure that `picaplot` is installed in the R environment used by `Rscript`. Record the R version, package versions and input expression normalization with the analysis results.
+
+**Script naming:** the uploaded terminal listing names the script `strategy2_ica_script.R`, while its header gives a different example filename. Commands in this document use `strategy2_ica_script.R` consistently. Save the R code alone, excluding the terminal prompt and `more` command.
+
+## 2. Input expression matrix
+
+The first column contains unique gene identifiers, and the header contains unique sample identifiers. Despite the example `.xls` extension, the script reads a plain tab-delimited text file with `read.delim()`, not an Excel workbook.
+
+Example layout, with columns separated by tabs:
+
+```text
+Gene	Sample_1	Sample_2	Sample_3	Sample_4
+Gene_A	10.2	12.5	3.1	4.6
+Gene_B	6.4	8.0	1.7	2.3
+Gene_C	0.5	1.1	5.7	6.2
+```
+
+The script requires numeric, nonnegative values, no missing or infinite values, and at least three samples. Expression normalization and low-expression filtering must be completed before analysis; the script does not perform library-size normalization or batch correction.
+
+The default transformation is `log2(x + 1)`. Supply expression values on the appropriate unlogged scale to avoid unintended repeated log transformation.
+
+## 3. Run the analysis
+
+### Default settings
+
+```bash
+Rscript strategy2_ica_script.R \
+    eQTL.expression.filtered.xls \
+    ICA_signed_results
+```
+
+### Explicit settings
+
+```bash
+Rscript strategy2_ica_script.R \
+    eQTL.expression.filtered.xls \
+    ICA_signed_results \
+    20 2.0 0.5 0.30 20 1 80 15 10 1234875
+```
+
+Arguments are positional. To change a later value, supply all preceding values in the order below.
+
+| Position | Argument | Default | Description |
+| :--- | :--- | :--- | :--- |
+| 1 | `expression_file` | `eQTL.expression.filtered.xls` | Input expression table |
+| 2 | `output_dir` | `ICA_signed_results` | Output directory |
+| 3 | `n_cores` | `20` | Cores requested for `runICA()` |
+| 4 | `loading_z_cutoff` | `2.0` | Minimum absolute robust loading Z-score |
+| 5 | `min_delta_z` | `0.5` | Minimum difference between the two largest absolute Z-scores |
+| 6 | `min_kME` | `0.30` | Minimum signed gene–module correlation |
+| 7 | `min_module_size` | `20` | Minimum module size checked during refinement |
+| 8 | `log_offset` | `1` | Offset in `log2(x + offset)` |
+| 9 | `var_cutoff` | `80` | Variance-percentage threshold passed to `runICA()` for component estimation |
+| 10 | `n_runs` | `15` | Repeated ICA runs requested |
+| 11 | `max_iter` | `10` | Package parameter for component-number estimation; not a specified FastICA solver iteration limit |
+| 12 | `seed` | `1234875` | Value supplied to `set.seed()` before ICA |
+
+## 4. Analysis procedure
+
+### 4.1 Preprocess expression
+
+The script validates the input, applies `log2(x + log_offset)` and excludes genes with zero or invalid variance across samples. Excluded genes are written separately when present; they are not included in the later module assignment table.
+
+### 4.2 Run ICA
+
+The transformed matrix is passed to:
+
+```r
+set.seed(seed)
+ica_result <- runICA(
+  transformed_matrix,
+  var_cutoff = var_cutoff,
+  max_iter = max_iter,
+  n_runs = n_runs,
+  n_cores = n_cores
+)
+```
+
+The script extracts two matrices: `S` contains gene loadings with genes in rows and components in columns; `A` contains component activities with components in rows and samples in columns. The number of returned components is obtained from `S`, rather than fixed at 80: `var_cutoff = 80` is a percentage threshold.
+
+### 4.3 Orient components and standardize loadings
+
+ICA component signs are arbitrary. For each component, the gene with the largest absolute raw loading is selected as an anchor. If its loading is negative, both that column of `S` and the corresponding row of `A` are multiplied by −1.
+
+Loadings are then standardized separately within each component:
+
+```text
+Z = (loading − median loading) / scaled MAD
+scaled MAD = 1.4826 × median absolute deviation from the median
+```
+
+If the scaled MAD is zero or invalid, the standard deviation is used instead. If both measures fail, all Z-scores for that component are set to zero.
+
+This orientation rule fixes polarity for a given result; it does not guarantee identical component numbering or results across package versions or independent runs.
+
+### 4.4 Assign genes to signed modules
+
+For each gene, the script finds the component with the largest absolute robust Z-score, then compares it with the second-largest value. With the default settings, initial assignment requires both:
+
+- Best absolute Z-score **≥ 2.0**.
+- Best minus second-best absolute Z-score **≥ 0.5**.
+
+Exact ties are resolved in favor of the first component, although they fail the default positive dominance threshold. For a single returned component, the second-best value is set to zero.
+
+| Example module | Meaning |
+| :--- | :--- |
+| `IC1_pos` | Positive standardized-loading tail of IC1 |
+| `IC1_neg` | Negative standardized-loading tail of IC1 |
+| `Unassigned` | Gene not retained in a final signed module |
+
+The tail label is based on the robust Z-score. It describes position relative to the component's loading distribution, rather than proving transcriptional activation or repression.
+
+### 4.5 Refine modules using kME
+
+For each signed module, the script calculates PC1 from its transformed expression matrix using centered and scaled genes. PC1 is oriented so that the median gene–PC1 correlation is nonnegative. A gene's `kME` is its Pearson correlation with this oriented PC1.
+
+Modules smaller than `min_module_size` are removed. Genes with nonfinite `kME` or `kME < min_kME` are removed without reassignment to another component. Refinement stops when no assignments change, or after **10 rounds**. This round limit is hard-coded and is separate from `max_iter` passed to `runICA()`.
+
+Final PC1 profiles and kME values are recalculated after refinement. Because the loop is capped, inspect the final module summary for sizes and minimum kME: a size change on the last round, or a change after the final PC1 recalculation, does not trigger another filtering pass.
+
+## 5. Assignment labels
+
+| `Assignment_Reason` | Meaning |
+| :--- | :--- |
+| `assigned` | Retained assignment |
+| `weak_loading` | Best absolute Z-score below the loading cutoff |
+| `ambiguous_loading` | Insufficient dominance over the second-best component |
+| `small_module` | Module removed during size filtering |
+| `low_signed_kME` | Gene removed during expression-coherence filtering |
+
+`Assignment_Quality` is a heuristic loading-based label. At the default settings, `High_confidence` requires absolute Z ≥ 3 and delta Z ≥ 1; `Medium_confidence` requires absolute Z ≥ 2.5 and delta Z ≥ 0.5; other initially assigned genes are `Low_confidence`. Removed genes are relabeled `Unassigned`. These labels are not probabilities, P-values or FDR estimates.
+
+Use `Final_Module` to select retained members. Best-component and initial-module fields remain available for unassigned genes and do not establish final membership.
+
+## 6. Main outputs
+
+All files are written under `ICA_signed_results/` by default.
+
+| File | Contents |
+| :--- | :--- |
+| `ICA_signed_gene_assignment.tsv` | Assignment and diagnostics for all genes used in ICA |
+| `ICA_unassigned_genes.tsv` | Genes without a retained final module |
+| `ICA_oriented_gene_weights.tsv` | Oriented raw gene loadings; genes × components |
+| `ICA_robust_loading_zscores.tsv` | Robust standardized loadings; genes × components |
+| `ICA_component_activities.samples_by_components.tsv` | ICA activities; samples × components |
+| `ICA_signed_module_eigengenes.samples_by_modules.tsv` | Final module PC1 scores; samples × signed modules |
+| `ICA_component_orientation.tsv` | Positive anchor gene for each component |
+| `ICA_component_percent_variance.tsv` | Component variance values, if supplied by `runICA()` |
+| `Module_IC*_genes.tsv` | Detailed gene list for each retained signed module |
+| `Module_IC*_genes_simple.txt` | Simplified tab-delimited module gene table |
+| `ICA_signed_module_summary.tsv` | Module sizes, direction and loading/kME summaries |
+| `ICA_signed_analysis_settings.tsv` | Parameters and analysis counts |
+| `ICA_signed_diagnostics.pdf` | Assignment, loading, module-size and activity plots |
+| `ICA_signed_report.txt` | Text report and interpretation notes |
+| `excluded_before_ICA.tsv` | Zero/invalid-variance genes; written only if such genes occur |
+
+The diagnostic PDF includes an activity heatmap scaled by component. It is a display transformation, separate from the exported activity values. The supplied code does not guard the heatmap call against a result with fewer than two components; check the log if plotting fails after the tables have been written.
+
+## 7. Downstream use
+
+| Question | Appropriate result |
+| :--- | :--- |
+| Which genes form a retained module? | `Final_Module` and the per-module gene tables |
+| How does an ICA component vary across samples? | Component activity table |
+| How does a particular signed gene set vary across samples? | Signed-module PC1 table |
+| Are modules associated with traits, eQTLs or genomic intervals? | Additional analyses using module profiles or gene sets |
+| Which gene pairs form network edges? | Additional gene–gene association calculations; no edge table is generated here |
+
+`IC1_pos` and `IC1_neg` originate from the same component and should not be counted as two independent ICA components. Component-level association should use one activity profile per IC. Signed-module PC1 profiles summarize different retained gene sets and are calculated separately.
+
+## Reference and reproducibility
+
+- [picaplot repository](https://github.com/jinhyunju/picaplot)
+- [runICA package documentation](https://rdrr.io/github/jinhyunju/picaplot/man/runICA.html)
+
+This document describes the supplied R code without modifying it. No expression data or ICA results were supplied, and the analysis has not been rerun during preparation of this documentation.
