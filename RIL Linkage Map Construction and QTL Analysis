@@ -1,0 +1,638 @@
+# RIL Linkage Map Construction and QTL Analysis
+
+**Complete supplied commands and R code for SNP binning, linkage-map evaluation and composite interval mapping in a cucumber recombinant inbred line population.**
+
+## Overview
+
+| Stage | Software | Main result |
+| :--- | :--- | :--- |
+| Infer genotype crosspoints | SNPbinner | Crosspoint calls for each RIL |
+| Construct bin markers | SNPbinner | Per-chromosome bin genotypes |
+| Convert genotype formats | Custom R/Python scripts | Lep-MAP3 input |
+| Evaluate the input marker order | Lep-MAP3 | Per-chromosome genetic maps |
+| Fill genotypes and re-estimate distances | R/qtl | Updated map and cross data |
+| Composite interval mapping (CIM) | R/qtl | Trait-specific LOD profiles |
+| Permutation testing and peak processing | R/qtl and custom peak function | Thresholds and candidate QTL summaries |
+
+The Bash block below preserves the supplied analysis parameters, with quoting and line wrapping for readability. The full R block reproduces the uploaded QTL script unchanged, including its original comments and project-specific paths. Review the implementation notes at the end before reuse.
+
+## 1. Requirements and input files
+
+| Requirement | Description |
+| :--- | :--- |
+| SNPbinner | `snpbinner crosspoints` and `snpbinner bins` |
+| Java and Lep-MAP3 | `ParentCall2` and `OrderMarkers2` |
+| R | Packages `qtl`, `eqtl` and `parallel` loaded by the supplied script |
+| `SNP.Code.chr1.tsv` … `SNP.Code.chr7.tsv` | SNP genotype tables, ordered by chromosome position |
+| `Convert.Format.bin2hp.R` | Custom bin-format conversion script |
+| `hp2lepmap.py` | Custom converter invoked once per chromosome |
+| `pedigree.txt` | Pedigree matching the genotype samples and Lep-MAP3 encoding |
+| `chr1_7.qtl.xls` | Combined genotype/map file in R/qtl `csvs` format |
+| `Input.Traits.csv` | Phenotype file in the corresponding R/qtl format |
+| `define.peak.R` | Custom file defining `define.peak1()` |
+
+The custom converters, pedigree, combined R/qtl input and peak-definition function were not supplied. In particular, the code that combines the chromosome maps into `chr1_7.qtl.xls` is not present, so that file must be prepared separately. Its `.xls` extension does not make it an Excel workbook: `read.cross("csvs", ...)` expects the R/qtl text format.
+
+For SNPbinner, the input includes a marker identifier, physical position and RIL genotype columns. Retain consistent individual identifiers and genotype encodings through all conversions. Keep physical positions in bp and linkage positions in cM distinguishable.
+
+## 2. Linkage map construction: complete Bash commands
+
+Save this block as `build_RIL_linkage_map.sh` and run it from the directory containing the SNP tables, converter R script and pedigree:
+
+```bash
+#!/usr/bin/env bash
+
+for i in 1 2 3 4 5 6 7
+do
+    snpbinner crosspoints \
+        --input "SNP.Code.chr${i}.tsv" \
+        --output "SNP.Code.chr${i}.cross.out" \
+        --min-ratio 0.01
+
+    snpbinner bins \
+        --input "SNP.Code.chr${i}.cross.out" \
+        --output "SNP.Code.chr${i}.bin.out" \
+        --min-bin-size 5000
+
+    Rscript Convert.Format.bin2hp.R "SNP.Code.chr${i}.bin.out"
+
+    /home/GuanJianTao/Low.Temperature.Experiments.dir/Binmap.dir/create.binmap.dir/hp2lepmap.py \
+        "$i"
+
+    java -Xmx50g \
+        -cp /home/GuanJianTao/Software/Lep_Map3/bin \
+        ParentCall2 \
+        data=pedigree.txt \
+        posteriorFile="chr${i}.for_lepmap" \
+        removeNonInformative=1 \
+        > "chr${i}.call.xls"
+
+    awk '{if($1!~/CHR/ && $1!~/^#/){print 1}}' \
+        "chr${i}.call.xls" > "chr${i}.group"
+
+    awk '{if($1!~/CHR/ && $1!~/^#/){n=n+1;print n}}' \
+        "chr${i}.call.xls" > "chr${i}.fix_order.txt"
+
+    java -Xmx100g \
+        -cp /home/GuanJianTao/Software/Lep_Map3/bin \
+        OrderMarkers2 \
+        data="chr${i}.call.xls" \
+        map="chr${i}.group" \
+        identicalLimit=0.01 \
+        minError=0.001 \
+        sexAveraged=1 \
+        informativeMask=3 \
+        numThreads=20 \
+        recombination1=0.001 \
+        recombination2=0.001 \
+        interference1=0.01 \
+        interference2=0.01 \
+        phasedData=0 \
+        evaluateOrder="chr${i}.fix_order.txt" \
+        improveOrder=0 \
+        useKosambi=1 \
+        grandparentPhase=1 \
+        computeLODScores="chr${i}.lod.xls" \
+        selfingPhase=1 \
+        > "chr${i}.lepmap.xls"
+done
+```
+
+Run with:
+
+```bash
+bash build_RIL_linkage_map.sh
+```
+
+### Key settings and interpretation
+
+| Setting | Value | Interpretation |
+| :--- | :--- | :--- |
+| Crosspoint `--min-ratio` | `0.01` | Minimum crosspoint spacing as a fraction of chromosome length; 1% here |
+| Binning `--min-bin-size` | `5000` | Requested minimum bin size, in bp |
+| `removeNonInformative` | `1` | Remove noninformative markers during parent calling |
+| Group assignment | All retained rows assigned `1` within each chromosome run | Chromosome membership is supplied rather than inferred here |
+| `evaluateOrder` | Sequential marker indices | Evaluate the existing input order |
+| `improveOrder` | `0` | Retain that order |
+| `sexAveraged` | `1` | Request a sex-averaged map |
+| `useKosambi` | `1` | Use the Kosambi mapping function |
+| `numThreads` | `20` | Threads requested for OrderMarkers2 |
+| Java heap | `50g` / `100g` | Maximum heap allocation for the two Java steps |
+
+The fixed order is a physical order only if all preceding input and conversion steps preserve physical ordering. This implementation does not independently infer seven linkage groups or freely reorder markers. Also, SNPbinner infers chromosome length from the last SNP when `--chrom-len` is not provided; the 1% spacing threshold can therefore depend on marker coverage.
+
+## 3. QTL analysis: complete supplied R code
+
+Save the entire following block as `RIL_QTL_analysis.R`. It first fills genotypes and re-estimates map distances, then reloads the exported cross for CIM and permutation testing.
+
+```r
+setwd(getwd())
+library(qtl)
+geno<-read.cross("csvs",phefile='Input.Traits.csv',genfile="chr1_7.qtl.xls",na.strings ="NA",estimate.map = FALSE,crosstype = 'riself',alleles=c("A","B","H")) ## loading the data for R/qtl mapping
+
+gt <- geno.table(geno)
+write.csv(gt,file="gt_before_convert.csv")
+
+
+#### draw genotype map before fill ##
+tiff("genotype_before_fill.tiff",height=15,width=10,units="cm",res=1000,compression="lzw",pointsize = 8)
+par(lwd=0.5)
+geno.image(geno)##based on marker number, not linkage or physical distance
+dev.off()
+
+##################################################################### geno filling
+geno<-fill.geno(geno, method="argmax",map.function="kosambi")
+##################################### count the crossover number ##########################################################################
+nxo<-countXO(geno,bychr=T)
+write.csv(nxo,file="Number_of_crossovers_after_filling.csv")
+
+#### draw genotype map after checking ##
+tiff("genotype_after_fill.tiff",width=10,height=15,units="cm",res=1000,compression="lzw",pointsize = 8)
+par(lwd=0.5)
+geno.image(geno)##based on marker number, not linkage or physical distance
+dev.off()
+#### check pairwise recombination fractions again####
+geno<-est.rf(geno)
+checkAlleles(geno,threshold=4)
+tiff("rf_after_drop.tiff",width=15,height=15,units="cm",res=1000,compression="lzw",pointsize = 8)
+par(lwd=0.5)
+#plot.rf(geno)
+dev.off()
+
+##################################### estimate the genetic map ##########################################################################
+nm<-est.map(geno, error.prob=0.0001,verbose=F,map.function="kosambi")
+geno<-replace.map(geno,nm)
+write.cross(geno,"csvs",filestem="CG104_after_fill2")
+
+
+
+
+
+#########################################################################################################################################
+
+library(eqtl)
+library(qtl)
+library(parallel)
+
+# 读取数据
+cross <- read.cross("csvs",
+                   phefile='CG104_after_fill2_phe.csv',
+                   genfile="CG104_after_fill2_gen.csv",
+                   na.strings = "-",
+                   estimate.map = FALSE,
+                   crosstype = 'riself',
+                   genotypes = c("AA","BB"))
+
+# 检查并清理表型数据
+print("检查表型数据结构:")
+print(str(cross$pheno))
+print("表型列名:")
+print(names(cross$pheno))
+
+# 识别并移除非数值型列
+numeric_cols <- sapply(cross$pheno, is.numeric)
+print("数值型列:")
+print(names(cross$pheno)[numeric_cols])
+
+if (!all(numeric_cols)) {
+    non_numeric_cols <- names(cross$pheno)[!numeric_cols]
+    print(paste("发现非数值型列:", paste(non_numeric_cols, collapse = ", ")))
+    print("将移除这些列...")
+
+    # 移除非数值型列
+    cross$pheno <- cross$pheno[, numeric_cols, drop = FALSE]
+}
+
+# 验证数据清理结果
+print(paste("清理后的表型数量:", nphe(cross)))
+print("剩余表型列名:")
+print(names(cross$pheno))
+
+# 使用jittermap()解决标记位置重复问题
+cross <- jittermap(cross)
+
+# 计算基因型概率
+tt <- calc.genoprob(cross)
+
+# 对第一个表型进行CIM分析
+mat <- cim(tt,
+          pheno.col = 1,
+          n.marcovar = 3,
+          window = 5,
+          method = c("hk"),
+          error.prob = 0.0001,
+          map.function = c("kosambi"),
+          imp.method = 'argmax')
+
+names(mat)[3] <- names(cross$pheno[1])
+
+# 改进的置换检验函数
+perm <- function(x, pheno.col, cross_data) {
+    library(qtl)
+
+    # 使用传入的cross数据
+    temp_cross <- cross_data
+
+    # 随机打乱表型数据
+    y <- temp_cross$pheno[, pheno.col]
+    o <- sample(length(y))
+    y <- y[o]
+    temp_cross$pheno[, pheno.col] <- y
+
+    # 计算基因型概率
+    temp_cross <- calc.genoprob(temp_cross)
+
+    # 进行CIM分析
+    temp <- cim(temp_cross,
+               pheno.col = pheno.col,
+               n.marcovar = 3,
+               window = 5,
+               method = c('hk'),
+               imp.method = 'argmax',
+               error.prob = 0.0001,
+               map.function = c('kosambi'))
+
+    return(max(temp[, 3], na.rm = TRUE))
+}
+
+# 检测可用核心数
+detectCores(logical = FALSE)
+mc <- min(getOption("mc.cores", 60), detectCores())
+print(paste("使用", mc, "个核心进行并行计算"))
+
+# 对第一个表型进行置换检验
+x <- 1:1000
+print("开始第一个表型的置换检验...")
+system.time({
+    res <- mclapply(x, perm, pheno.col = 1, cross_data = cross, mc.cores = mc)
+})
+
+operm <- matrix(ncol = 1, nrow = 1000, as.vector(unlist(res)))
+class(operm) <- c("scanoneperm", "matrix")
+thrs <- summary(operm, alpha = c(0.05))[1, 1]
+
+print(paste("第一个表型的阈值:", thrs))
+
+# 循环处理剩余表型
+total_phenotypes <- nphe(cross)
+print(paste("总共需要分析", total_phenotypes, "个表型"))
+
+for(i in 2:total_phenotypes) {
+    print(paste("正在处理第", i, "个表型:", names(cross$pheno)[i]))
+
+    # 重新计算基因型概率
+    tt <- calc.genoprob(cross)
+
+    # CIM分析
+    out.cim <- cim(tt,
+                  pheno.col = i,
+                  n.marcovar = 3,
+                  window = 5,
+                  method = c("hk"),
+                  error.prob = 0.0001,
+                  map.function = c("kosambi"),
+                  imp.method = 'argmax')
+
+    # 置换检验
+    system.time({
+        res <- mclapply(x, perm, pheno.col = i, cross_data = cross, mc.cores = mc)
+    })
+
+    operm <- matrix(ncol = 1, nrow = 1000, as.vector(unlist(res)))
+    class(operm) <- c("scanoneperm", "matrix")
+    thr <- summary(operm, alpha = c(0.05))[1, 1]
+    thrs <- c(thrs, thr)
+
+    # 更新结果矩阵
+    names(out.cim)[3] <- names(cross$pheno[i])
+    mat$phe <- out.cim[, 3]
+    names(mat)[ncol(mat)] <- names(cross$pheno[i])
+
+    print(paste("第", i, "个表型完成，阈值:", thr))
+}
+
+print("QTL分析完成!")
+print("最终阈值:")
+print(thrs)
+
+# 修正后的QTL分析后续脚本
+
+# 添加最后一列（如果需要）
+if(ncol(mat) < 12) {
+    mat$last <- mat[, ncol(mat)]
+}
+
+# 初始化结果
+peak <- NULL
+
+# 加载峰值定义函数
+source("/home/GuanJianTao/Low.Temperature.Experiments.dir/Binmap.dir/QTL.dir/define.peak.R")
+
+# 检查数据维度一致性
+print(paste("表型数量:", nphe(cross)))
+print(paste("mat列数:", ncol(mat)))
+print(paste("thrs长度:", length(thrs)))
+
+# 计算有效的LOD列数（排除chr和pos列）
+lod_columns <- ncol(mat) - 2  # 减去chr和pos列
+print(paste("LOD列数:", lod_columns))
+print(paste("mat总列数:", ncol(mat)))
+
+# 峰值检测
+for(i in 1:min(nphe(cross), lod_columns)) {
+    print(paste("处理表型", i, ":", names(cross$pheno)[i]))
+
+    # 确保lodcolumn在有效范围内
+    if(i <= lod_columns && (i + 2) <= ncol(mat)) {
+        tryCatch({
+            peaks <- define.peak1(mat, lodcolumn = i)
+
+            for(j in 1:9) {
+                sub <- as.data.frame(peaks[[1]][j])
+                if(ncol(sub) > 1) {
+                    names(sub) <- c('lod','peak.pos','peak.cM','inf.pos','inf.cM','sup.pos','sup.cM','si.quality')
+                    sub$chrom <- names(peaks[[1]][j])
+
+                    # 安全地获取trait名称
+                    trait_col_idx <- i + 2
+                    if(trait_col_idx <= ncol(mat)) {
+                        sub$trait <- names(mat)[trait_col_idx]
+                    } else {
+                        sub$trait <- names(cross$pheno)[i]
+                    }
+
+                    # 计算LOD值
+                    lod <- NULL
+                    for(z in 1:nrow(sub)) {
+                        row_idx <- which(row.names(mat) == sub$peak.pos[z])
+                        if(length(row_idx) > 0 && trait_col_idx <= ncol(mat)) {
+                            lod <- c(lod, mat[row_idx, trait_col_idx])
+                        } else {
+                            lod <- c(lod, NA)
+                        }
+                    }
+                    sub$LOD <- lod
+                    peak <- rbind(peak, sub)
+                }
+                print(c(i, j))
+            }
+        }, error = function(e) {
+            print(paste("处理表型", i, "时出错:", e$message))
+        })
+    } else {
+        print(paste("跳过表型", i, ": lodcolumn超出范围"))
+    }
+}
+
+# 修正cutoff创建 - 确保长度匹配
+actual_phenotypes <- min(nphe(cross), lod_columns)  # 使用实际可处理的表型数量
+actual_thrs_length <- length(thrs)
+
+print(paste("实际可处理表型数量:", actual_phenotypes))
+print(paste("实际阈值数量:", actual_thrs_length))
+
+# 创建cutoff数据框，确保长度匹配
+if(actual_thrs_length >= actual_phenotypes) {
+    cutoff <- data.frame(
+        traits = names(cross$pheno)[1:actual_phenotypes],
+        lod = thrs[1:actual_phenotypes],
+        stringsAsFactors = FALSE
+    )
+} else {
+    # 如果thrs长度不够，用最后一个值填充
+    cutoff <- data.frame(
+        traits = names(cross$pheno)[1:actual_phenotypes],
+        lod = c(thrs, rep(thrs[length(thrs)], actual_phenotypes - actual_thrs_length)),
+        stringsAsFactors = FALSE
+    )
+    print(paste("警告: thrs长度不足，用最后一个值填充"))
+}
+
+print("cutoff数据框创建完成:")
+print(head(cutoff))
+
+# 计算PVE（表型变异解释率）
+xx <- calc.genoprob(cross, map.function = 'kosambi')
+PVE <- NULL
+
+if(!is.null(peak) && nrow(peak) > 0) {
+    for(i in 1:nrow(peak)) {
+        tryCatch({
+            # 创建QTL对象
+            qtl <- makeqtl(xx,
+                          chr = as.character(peak$chrom[i]),
+                          pos = as.numeric(peak$peak.cM[i]),
+                          what = 'prob')
+
+            # 找到对应的表型列
+            trait_name <- peak$trait[i]
+            pheno_col <- which(names(cross$pheno) == trait_name)
+
+            if(length(pheno_col) > 0) {
+                # 拟合QTL
+                pve <- fitqtl(xx,
+                             pheno.col = pheno_col,
+                             qtl = qtl,
+                             method = "hk",
+                             maxit = 10000,
+                             get.ests = FALSE,
+                             dropone = TRUE)
+
+                PVE <- c(PVE, pve$result.full[1, 5])
+            } else {
+                PVE <- c(PVE, NA)
+                print(paste("警告: 找不到表型", trait_name))
+            }
+
+            print(paste("完成PVE计算:", i))
+        }, error = function(e) {
+            print(paste("PVE计算出错:", i, "错误:", e$message))
+            PVE <<- c(PVE, NA)
+        })
+    }
+
+    # 添加PVE到peak数据框
+    peak$PVE <- PVE
+
+    # 计算置信区间
+    peak$inter <- apply(peak, 1, function(x) {
+        tryCatch({
+            sup_parts <- strsplit(x[6], '_')[[1]]
+            inf_parts <- strsplit(x[4], '_')[[1]]
+            if(length(sup_parts) >= 2 && length(inf_parts) >= 2) {
+                as.numeric(sup_parts[2]) - as.numeric(inf_parts[2])
+            } else {
+                NA
+            }
+        }, error = function(e) {
+            NA
+        })
+    })
+
+    # 创建格式化的peak数据框
+    peak1 <- peak
+    peak1$LOD <- round(peak1$LOD, 2)
+    peak1$PVE <- round(peak1$PVE, 2)
+
+    # 计算加性效应
+    x <- sim.geno(cross)
+    mat2 <- NULL
+
+    for(i in 1:actual_phenotypes) {  # 使用actual_phenotypes而不是nphe(cross)
+        tryCatch({
+            x1 <- as.data.frame(effectscan(x, pheno.col = i))
+            x1$pheno <- names(cross$pheno[i])
+            x1$pos <- row.names(x1)
+            mat2 <- rbind(mat2, x1)
+        }, error = function(e) {
+            print(paste("加性效应计算出错，表型", i, ":", e$message))
+        })
+    }
+
+    # 添加加性效应到peak1
+    if(!is.null(mat2)) {
+        peak1$additive <- 1
+        for(i in 1:nrow(peak1)) {
+            trait <- as.character(peak1$trait[i])
+            matching_rows <- which(mat2$pheno == trait & mat2$pos == peak1$peak.pos[i])
+            if(length(matching_rows) > 0) {
+                peak1$additive[i] <- mat2$a[matching_rows[1]]
+            } else {
+                peak1$additive[i] <- NA
+            }
+        }
+    }
+
+    # 写入结果文件
+    write.table(cbind("marker" = rownames(mat2), mat2),
+                'all_additive_before_filter.xls',
+                quote = FALSE, row.names = FALSE, sep = "\t")
+
+    write.table(peak1,
+                'final_qtl_with_peak_before_filter.xls',
+                quote = FALSE, row.names = FALSE, sep = "\t")
+} else {
+    print("警告: 没有检测到峰值")
+    peak1 <- NULL
+}
+
+# 写入主要结果
+mat <- as.data.frame(mat)
+write.table(cbind("marker" = rownames(mat), mat),
+            'qtl.result_before_filter.xls',
+            quote = FALSE, sep = "\t", row.names = FALSE)
+
+write.table(cutoff,
+            'cutoff_for_eachPhen.xls',
+            quote = FALSE, sep = "\t", row.names = FALSE)
+
+# 根据cutoff过滤结果
+if(!is.null(peak1) && nrow(peak1) > 0) {
+    mat_fin <- NULL
+    for(i in 1:nrow(cutoff)) {
+        n1 <- which(peak1$trait == cutoff$traits[i] & peak1$LOD >= cutoff$lod[i])
+        if(length(n1) > 0) {
+            sub <- peak1[n1, ]
+            sub$cutoff <- cutoff$lod[i]
+            mat_fin <- rbind(mat_fin, sub)
+        }
+    }
+
+    if(!is.null(mat_fin)) {
+        write.table(mat_fin,
+                    'final_qtl_with_peak_filtered.xls',
+                    quote = FALSE, sep = "\t", row.names = FALSE)
+        print(paste("过滤后的QTL数量:", nrow(mat_fin)))
+    } else {
+        print("警告: 过滤后没有显著的QTL")
+    }
+} else {
+    print("警告: 没有峰值数据可供过滤")
+}
+
+print("QTL分析完成！")
+```
+
+Run after preparing the required inputs and updating the custom script path:
+
+```bash
+Rscript RIL_QTL_analysis.R > RIL_QTL_analysis.log 2>&1
+```
+
+## 4. QTL settings and analysis sequence
+
+The first part imports a selfed RIL cross (`riself`), fills missing genotypes by the most likely genotype sequence, counts inferred crossovers, estimates recombination fractions and re-estimates the map. The updated cross is exported with the prefix `CG104_after_fill2` and reloaded in the second part. This prefix is retained from the supplied code; it is an output label and should be adapted to the actual population if necessary.
+
+| Setting | Supplied value |
+| :--- | :--- |
+| Cross type | Selfed recombinant inbred lines, `riself` |
+| Genotype filling | `argmax` |
+| Map-estimation error probability | `0.0001` |
+| Map-estimation function | Kosambi |
+| CIM method | Haley–Knott regression, `hk` |
+| Marker covariates | `3` |
+| CIM exclusion window | `5 cM` |
+| CIM error-probability argument | `0.0001` |
+| CIM map-function argument | Kosambi |
+| Permutations | `1000` per analyzed phenotype |
+| Significance level | `0.05` per phenotype |
+| Parallel permutation workers | Up to `60`, constrained by detected cores and the R `mc.cores` option |
+
+Only numeric phenotype columns are retained. For each trait, the script permutes phenotype values, reruns CIM and records the maximum LOD across the scan. These maxima define a genome-wide threshold for that trait; this procedure does not additionally correct across all traits.
+
+Peak extraction uses the external `define.peak1()` function. Without its source, the peak-selection and interval-definition method cannot be specified from this script alone. The code then fits each candidate QTL individually and extracts `result.full[1, 5]` as PVE. It estimates additive effects separately using `sim.geno()` and `effectscan()` and filters peaks against the trait-specific threshold.
+
+## 5. Main outputs
+
+### Linkage mapping
+
+| File pattern | Contents |
+| :--- | :--- |
+| `SNP.Code.chr*.cross.out` | SNPbinner crosspoint calls |
+| `SNP.Code.chr*.bin.out` | Bin genotypes |
+| `chr*.for_lepmap` | Expected custom-converter output |
+| `chr*.call.xls` | ParentCall2 output |
+| `chr*.group` | One-group assignment for that chromosome |
+| `chr*.fix_order.txt` | Sequential marker indices |
+| `chr*.lepmap.xls` | OrderMarkers2 output |
+| `chr*.lod.xls` | Requested Lep-MAP3 LOD-score output |
+
+### QTL mapping
+
+| File | Contents |
+| :--- | :--- |
+| `gt_before_convert.csv` | Genotype summary before filling |
+| `genotype_before_fill.tiff` | Genotype image before filling |
+| `genotype_after_fill.tiff` | Genotype image after filling |
+| `Number_of_crossovers_after_filling.csv` | Inferred crossover counts by chromosome |
+| `CG104_after_fill2_gen.csv` | Exported genotypes and updated map |
+| `CG104_after_fill2_phe.csv` | Exported phenotypes |
+| `qtl.result_before_filter.xls` | Combined scan results |
+| `cutoff_for_eachPhen.xls` | Trait-specific permutation thresholds |
+| `all_additive_before_filter.xls` | Effect-scan output, when reached |
+| `final_qtl_with_peak_before_filter.xls` | Candidate peaks with PVE and effect summaries |
+| `final_qtl_with_peak_filtered.xls` | Peaks passing the trait threshold; written when significant peaks exist |
+
+The `.xls` result files are tab-delimited text. Some outputs are conditional on successful peak detection and subsequent calculations. The script opens `rf_after_drop.tiff`, but its `plot.rf()` call is commented out, so this is not an active recombination-fraction plot.
+
+## 6. Implementation notes for reuse
+
+The full R code above is preserved for traceability. These details require attention before treating it as a general workflow:
+
+- **Custom functions and data conversion:** supply the exact converter scripts and `define.peak.R`. Their input conventions and peak intervals cannot be reconstructed from the calls alone. Check the pedigree and selfing/grandparent phasing configuration against the actual cross.
+- **Seven chromosomes versus a fixed loop:** peak processing uses `for(j in 1:9)`. Check the object returned by `define.peak1()` and iterate over its actual entries; the linkage-map loop covers seven chromosomes.
+- **Single-trait input:** `for(i in 2:total_phenotypes)` is unsuitable when only one numeric phenotype remains, because R evaluates `2:1` as two indices. This branch needs an explicit guard for single-trait datasets.
+- **Threshold fallback:** the code repeats the last threshold when thresholds are missing. For inferential use, obtain a valid permutation threshold for every tested trait instead of borrowing another trait's threshold.
+- **Scan-table padding:** the `mat$last` branch duplicates the last column when there are fewer than 12 columns. This is a legacy formatting operation and does not represent an additional phenotype.
+- **Genotype probabilities:** the first `calc.genoprob(cross)` calls use package defaults, while later CIM calls specify other error/map-function arguments. Confirm the effective settings used for existing probability objects. If revising the analysis, harmonize probability calculations and scans explicitly.
+- **Intervals and effects:** `inter` is a difference parsed from marker-name strings, not a newly calculated statistical confidence interval. Its units depend on those identifiers. PVE comes from one-QTL fits, and the additive-effect sign depends on allele coding; neither is a joint multi-QTL model estimate.
+- **Randomness and parallelism:** the supplied script does not set a random seed. Record a seed before stochastic operations and use an appropriate reproducible parallel RNG setup for repeatable permutation results. Fork-based `mclapply()` parallelism is intended for a compatible Unix-like environment.
+
+## Documentation
+
+- [SNPbinner](https://github.com/solgenomics/SNPbinner)
+- [Lep-MAP3 modules](https://sourceforge.net/p/lep-map3/wiki/Modules/)
+- [R/qtl](https://rqtl.org/)
+- [R/qtl reference manual](https://rqtl.org/manual/qtl-manual.pdf)
+
+The embedded Bash examples were checked for shell syntax, and the embedded R source was checked against the supplied attachment. R and the biological input datasets were not available for execution here; this document is not a validated analysis run.
