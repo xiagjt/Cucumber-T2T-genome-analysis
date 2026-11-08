@@ -1,0 +1,197 @@
+# Structural Variant Identification and RIL Genotyping
+
+**Identify assembly differences with MUMmer4/SyRI and genotype a prepared SV panel in a recombinant inbred line population using short-read resequencing data and Paragraph.**
+
+## Overview
+
+| Stage | Inputs | Software | Result |
+| :--- | :--- | :--- | :--- |
+| Whole-genome alignment | HW64 reference and DML query assemblies | MUMmer4 | Filtered alignments and coordinates |
+| Variant identification | Alignments and both assemblies | SyRI | Structural rearrangement and sequence-variant annotations |
+| Panel preparation | Selected variants from assembly comparisons | Preparation commands not supplied | `merged_CLv5_DML.paragraph.vcf` |
+| Population genotyping | Prepared panel, RIL BAMs and HW64 reference | Paragraph | Per-sample genotypes for candidate SVs |
+
+Discovery and genotyping are separate steps: SyRI compares assemblies, while Paragraph tests a supplied variant panel using resequencing alignments. The commands below preserve the supplied paths and analysis parameters, with quoting and line wrapping for readability.
+
+## 1. Requirements
+
+- MUMmer4, using the supplied `mummer-4.0.0rc1` installation.
+- SyRI.
+- Paragraph, with `multigrmpy.py` on the executable search path.
+- Indexed, coordinate-sorted BAM files from the RIL short-read resequencing data.
+- The same HW64 reference sequence for assembly comparison coordinates, the variant panel and BAM alignment.
+
+Record the actual SyRI and Paragraph versions used. Their versions were not specified in the supplied commands.
+
+## 2. SV identification: complete commands
+
+Save this block as `identify_SVs_DML.sh` and run it from the directory containing the two genome FASTA files:
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+refgenome="HW64.T2T.fa"
+qrygenome="DML.T2T.fa"
+
+/home/Software.Repository/Mummer4/mummer-4.0.0rc1/nucmer \
+    -c 100 \
+    -b 500 \
+    -l 50 \
+    -t 20 \
+    -p DML.test4 \
+    "$refgenome" \
+    "$qrygenome"
+
+/home/Software.Repository/Mummer4/mummer-4.0.0rc1/delta-filter \
+    -m -i 90 -l 100 \
+    DML.test4.delta \
+    > DML.test4.filter.delta
+
+/home/Software.Repository/Mummer4/mummer-4.0.0rc1/show-coords \
+    -rdTH \
+    DML.test4.filter.delta \
+    > DML.test4.coords
+
+syri \
+    --nc 60 \
+    -c DML.test4.coords \
+    -d DML.test4.filter.delta \
+    -r "$refgenome" \
+    -q "$qrygenome" \
+    --prefix DML.syri.mummer4
+```
+
+A Bash header and error-stop settings have been added; the underlying analysis options are unchanged.
+
+Run with:
+
+```bash
+bash identify_SVs_DML.sh > identify_SVs_DML.log 2>&1
+```
+
+### Alignment and comparison parameters
+
+| Option | Value | Description |
+| :--- | :--- | :--- |
+| NUCmer `-c` | `100` | Minimum cluster length |
+| NUCmer `-b` | `500` | Distance permitted for extending a poorly scoring alignment region before stopping |
+| NUCmer `-l` | `50` | Minimum exact-match length |
+| NUCmer `-t` | `20` | Threads |
+| NUCmer `-p` | `DML.test4` | Alignment output prefix |
+| delta-filter `-m` | Enabled | Many-to-many alignment selection |
+| delta-filter `-i` | `90` | Minimum alignment identity, in percent |
+| delta-filter `-l` | `100` | Minimum alignment length |
+| show-coords `-rdTH` | Enabled | Reference-sorted, header-free tabular coordinates including alignment direction |
+| SyRI `--nc` | `60` | CPU allocation |
+| SyRI `--prefix` | `DML.syri.mummer4` | Output filename prefix |
+
+`-b 500` is the NUCmer break-length setting; it should not be described as `-g 500` or a minimum SV size. The supplied command also does not explicitly set `--mum`.
+
+### Reference direction
+
+HW64 defines the reference coordinate system, and DML is the query. Insertions and deletions must be interpreted in that direction. An analogous HW64-versus-CLv5 comparison requires the CLv5 query FASTA and distinct output prefixes; that comparison command was not supplied here.
+
+## 3. Prepare the SV panel for Paragraph
+
+The genotyping command starts from:
+
+```text
+merged_CLv5_DML.paragraph.vcf
+```
+
+The commands that select, convert and merge the assembly-derived variants into this file were not supplied. Thus, the SyRI command alone does not recreate this merged panel.
+
+Before genotyping, ensure that the panel's coordinates and REF alleles match HW64, that event IDs are suitable for tracking, and that the variant representations are supported by the installed Paragraph version. The provided discovery command does not implement an explicit ≥50-bp SV filter or a nonredundant cross-comparison merge; document those rules separately if they were used.
+
+Paragraph supports sequence-resolved alleles and specified symbolic SV representations. Its documented symbolic forms include deletion, insertion, duplication and inversion. Symbolic deletions, duplications and inversions require `END`; symbolic insertions require the inserted sequence, normally in `SEQ`. Do not assume every SyRI rearrangement record, particularly a translocation or complex event, is directly compatible with this input format.
+
+## 4. Prepare the RIL resequencing manifest
+
+`samples.config.txt` is a sample manifest, not a BAM file. Each row identifies a RIL and its short-read alignment file. The BAMs must be accessible with their indexes and must have been aligned to the same HW64 reference used for the panel.
+
+An illustrative tab-delimited manifest is:
+
+```text
+id	path	read length	depth
+RIL001	/path/to/RIL001.sorted.bam	150	50
+RIL002	/path/to/RIL002.sorted.bam	150	50
+```
+
+These sample names, lengths and depths are examples, not measured values for this population. Replace them with the actual sample IDs, paths and average sequencing metrics. Preserve the literal header `read length` as required by the documented manifest format.
+
+The read-alignment and BAM-processing commands were not supplied in this step. Paragraph begins from those alignments, rather than directly from FASTQ files.
+
+## 5. RIL SV genotyping: complete commands
+
+Save this block as `paragraph.run.sh` in the genotyping directory:
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+vcf="merged_CLv5_DML.paragraph.vcf"
+bam="samples.config.txt"
+ref="/bioinfo/guanjt/Genome.CG64.dir/LM.dir/Index.dir/HW64.T2T.fa"
+
+multigrmpy.py \
+    -i "$vcf" \
+    -m "$bam" \
+    -r "$ref" \
+    -o ./ \
+    --threads 80
+```
+
+The variable `bam` retains its original name but points to the manifest. The output directory `./` also follows the supplied command; use a dedicated working directory for each run.
+
+Run with:
+
+```bash
+bash paragraph.run.sh > paragraph.run.log 2>&1
+```
+
+| Option | Supplied value | Meaning |
+| :--- | :--- | :--- |
+| `-i` | `merged_CLv5_DML.paragraph.vcf` | Candidate SV panel |
+| `-m` | `samples.config.txt` | Sample manifest |
+| `-r` | HW64 T2T FASTA | Reference matching the VCF and BAMs |
+| `-o` | `./` | Output directory |
+| `--threads` | `80` | Requested parallelism |
+
+## 6. Main outputs
+
+### Assembly comparison
+
+| File | Contents |
+| :--- | :--- |
+| `DML.test4.delta` | NUCmer alignments |
+| `DML.test4.filter.delta` | Filtered alignments |
+| `DML.test4.coords` | Coordinate table supplied to SyRI |
+| SyRI-prefixed `syri.out` | Structural and alignment annotations |
+| SyRI-prefixed `syri.vcf` | Variant representation produced by SyRI |
+
+The SyRI prefix is reproduced exactly as supplied. Inspect the emitted filenames rather than assuming an additional separator is inserted automatically.
+
+### Population genotyping
+
+| File | Contents |
+| :--- | :--- |
+| `genotypes.vcf.gz` | Candidate variants with population genotypes |
+| `genotypes.json.gz` | Detailed graph-genotyping results |
+| `variants.vcf.gz` | Input variants with Paragraph-assigned identifiers |
+| `variants.json.gz` | Graph representations of the input variants |
+| `grmpy.log` | Workflow log |
+| `paragraph.run.log` | Combined execution log from the example launch command |
+
+These are the standard documented outputs; retain the logs from the actual installation. Genotypes such as `0/0`, `0/1` and `1/1` are relative to each VCF's reference/alternate alleles and should not be relabeled as parental A/B states without checking the parents.
+
+
+## References and validation
+
+- [MUMmer4](https://github.com/mummer4/mummer)
+- [SyRI workflow](https://schneebergerlab.github.io/syri/example.html)
+- [SyRI file formats](https://schneebergerlab.github.io/syri/fileformat.html)
+- [Paragraph input requirements and usage](https://github.com/Illumina/paragraph/blob/master/README.md)
+- [Paragraph graph tools](https://github.com/Illumina/paragraph/blob/master/doc/graph-tools.md)
+
+The Bash examples have been checked for syntax. The assemblies, panel VCF, manifest and BAMs were not available for execution here, so no SV calls or population genotypes were generated during preparation of this document.
