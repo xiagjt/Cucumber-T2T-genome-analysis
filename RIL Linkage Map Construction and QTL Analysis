@@ -578,9 +578,6 @@ The first part imports a selfed RIL cross (`riself`), fills missing genotypes by
 | Significance level | `0.05` per phenotype |
 | Parallel permutation workers | Up to `60`, constrained by detected cores and the R `mc.cores` option |
 
-Only numeric phenotype columns are retained. For each trait, the script permutes phenotype values, reruns CIM and records the maximum LOD across the scan. These maxima define a genome-wide threshold for that trait; this procedure does not additionally correct across all traits.
-
-Peak extraction uses the external `define.peak1()` function. Without its source, the peak-selection and interval-definition method cannot be specified from this script alone. The code then fits each candidate QTL individually and extracts `result.full[1, 5]` as PVE. It estimates additive effects separately using `sim.geno()` and `effectscan()` and filters peaks against the trait-specific threshold.
 
 ## 5. Main outputs
 
