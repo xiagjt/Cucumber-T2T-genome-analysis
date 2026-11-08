@@ -1,0 +1,172 @@
+# Genome Assembly and Gene Annotation
+
+**Assembly commands and structural gene annotation workflows for the HW64, DML and CLv5.0 cucumber genomes.**
+
+## Overview
+
+HW64 and DML were annotated using a combination of transcript evidence, protein homology and ab initio prediction, followed by long-read transcript analysis with IsoQuant. CLv5.0 was annotated by transferring CLv4.0 gene models with Liftoff and incorporating IsoQuant-derived transcript evidence. Gene annotations for all three genomes were subsequently manually curated using GSAman.
+
+| Genome | Initial gene annotation | Long-read transcript evidence | Final refinement |
+| :--- | :--- | :--- | :--- |
+| HW64 | Evidence-integrated annotation following the linked cucumber pangenome workflow | PacBio HiFi Kinnex; IsoQuant `pacbio_ccs` mode | GSAman manual curation |
+| DML | Evidence-integrated annotation following the linked cucumber pangenome workflow | Oxford Nanopore; IsoQuant `nanopore` mode | GSAman manual curation |
+| CLv5.0 | Liftoff transfer of CLv4.0 gene models | Iso-seq data processed with IsoQuant; mode selected for the sequencing platform | GSAman manual curation |
+
+## 1. Genome assembly
+
+### 1.1 Assembly with hifiasm
+
+The supplied assembly command uses **hifiasm v0.25.0** in ONT mode with 80 threads:
+
+```bash
+/home/GuanJianTao/Software/hifiasm-0.25.0/hifiasm \
+    -t 80 \
+    --ont \
+    -o ONT.asm \
+    /vol2/GuanJianTao/CG64/Assembly.dir/UltraONT.20240628/Merge.Three.pass.all.fq.gz
+```
+
+| Argument | Value | Description |
+| :--- | :--- | :--- |
+| `-t` | `80` | Number of threads |
+| `--ont` | Enabled | Assemble ONT reads |
+| `-o` | `ONT.asm` | Output prefix |
+| Positional input | `Merge.Three.pass.all.fq.gz` | Genomic ONT reads in compressed FASTQ format |
+
+For another dataset, replace the read path and output prefix and run in a separate assembly directory. The command above records the supplied CG64 example; accession-specific assembly commands for other datasets are not inferred from it.
+
+### 1.2 Assembly supplied for annotation
+
+The annotation steps below use the finalized genome FASTA for each accession. The hifiasm command documents the contig assembly step. Any subsequent chromosome construction, gap closure, sequence correction or repeat masking should be documented separately using the actual procedures applied.
+
+## 2. HW64 and DML: initial gene annotation
+
+The initial structural annotation followed the [cucumber pangenome gene annotation workflow](https://github.com/xiagjt/Cucumber.Pangenome/blob/main/Gene%20annotation.md). That workflow combines the following evidence and prediction stages:
+
+| Stage | Tools | Role |
+| :--- | :--- | :--- |
+| Genome-guided transcript reconstruction | HISAT2, SAMtools, StringTie; TACO or StringTie merge | Generate and combine RNA-seq transcript assemblies |
+| De novo transcript reconstruction | Trinity | Generate additional transcript evidence |
+| Transcript alignment and refinement | PASA | Derive transcript-supported gene structures |
+| Ab initio prediction | BRAKER2 / AUGUSTUS | Predict gene structures using supporting evidence |
+| Protein homology | GenomeThreader | Provide protein-to-genome alignment evidence |
+| Evidence integration | EvidenceModeler (EVM) | Produce an integrated preliminary gene set |
+
+See the linked workflow for its detailed commands and post-processing. Apply the workflow independently to the HW64 and DML assemblies, using the corresponding transcript data and genome coordinates. The resulting EVM annotations serve as the reference gene models for the IsoQuant analyses below.
+
+## 3. HW64: PacBio HiFi Kinnex transcript evidence
+
+HW64 full-length transcript data were analyzed with IsoQuant using the PacBio CCS data type. The supplied command is formatted below without changing its analysis parameters:
+
+```bash
+isoquant.py \
+    --reference /vol2/GuanJianTao/CG64/Assembly.dir/RG.assembly/2.assembly/Add.45S.dir/CG64.Nuclear.Add.Softmask.fa \
+    --genedb /vol2/GuanJianTao/CG64/Annotation.dir/EvidenceMod.dir/EVM.all.gtf \
+    --fastq ../hifi_reads/FL.Iso.Seq.fastq.gz \
+    --data_type pacbio_ccs \
+    -o isoquant.out \
+    --threads 70
+```
+
+The FASTQ input should contain the processed transcript reads from the Kinnex experiment. This command starts from those reads; it does not perform Kinnex array segmentation or upstream library processing. The relative FASTQ path is resolved from the directory in which the command is launched.
+
+## 4. DML: ONT transcript evidence
+
+DML full-length ONT transcript reads were analyzed with IsoQuant using the DML assembly and its preliminary EVM annotation. Replace the example paths below with the actual DML files:
+
+```bash
+isoquant.py \
+    --reference /path/to/DML.T2T.softmasked.fa \
+    --genedb /path/to/DML.EVM.all.gtf \
+    --fastq /path/to/DML.ONT.full_length.fastq.gz \
+    --data_type nanopore \
+    -o DML.isoquant.out \
+    --threads 70
+```
+
+The platform-specific change relative to HW64 is `--data_type nanopore`. Each genome must be paired with its own annotation and transcript reads.
+
+## 5. CLv5.0: annotation transfer and transcript evidence
+
+### 5.1 Transfer CLv4.0 gene models with Liftoff
+
+Gene models from CLv4.0 were transferred onto CLv5.0 using Liftoff:
+
+```bash
+liftoff \
+    -g CLv4.Gene.gff3 \
+    -o CLv5.Liftoff.gff3 \
+    -copies \
+    CLv5.all.fa \
+    CLv4.fa
+```
+
+| Input or argument | Description |
+| :--- | :--- |
+| `CLv4.Gene.gff3` | Source annotation on CLv4.0 |
+| `CLv5.all.fa` | Target genome receiving the annotation |
+| `CLv4.fa` | Reference genome carrying the source annotation |
+| `-copies` | Search for additional gene copies in the target genome |
+| `CLv5.Liftoff.gff3` | Transferred annotation in CLv5.0 coordinates |
+
+The positional FASTA order is **target first, reference second**. The transferred models provide the initial gene annotation for CLv5.0.
+
+### 5.2 Analyze Iso-seq reads with IsoQuant
+
+IsoQuant was used to align and analyze the long-read transcript data against CLv5.0, using the transferred annotation as the reference gene set. The following is a command template; set `CLV5_DATA_TYPE` to match the actual sequencing platform before running it.
+
+```bash
+# Set one value in this Bash session before running the command:
+# CLV5_DATA_TYPE=pacbio_ccs   # PacBio HiFi / CCS transcript reads
+# CLV5_DATA_TYPE=nanopore    # Oxford Nanopore transcript reads
+
+isoquant.py \
+    --reference CLv5.all.fa \
+    --genedb CLv5.Liftoff.gff3 \
+    --fastq /path/to/CLv5.full_length.fastq.gz \
+    --data_type pacbio_ccs \
+    -o CLv5.isoquant.out \
+    --threads 70
+```
+
+The CLv5.0 transcript sequencing platform was not specified in the supplied workflow, so its IsoQuant data type is deliberately left configurable. For other platforms, select and document the data-type setting used in the actual analysis.
+
+## 6. IsoQuant inputs and use of results
+
+| Option | Purpose |
+| :--- | :--- |
+| `--reference` | Genome FASTA used for transcript alignment |
+| `--genedb` | Preliminary gene annotation in GTF/GFF format |
+| `--fastq` | Long-read transcript sequences |
+| `--data_type` | Platform-appropriate processing mode |
+| `-o` | Output directory |
+| `--threads` | Number of threads; `70` in these examples |
+
+The genome FASTA and reference annotation must use matching sequence identifiers and coordinates. IsoQuant results provide transcript models and read support for reviewing the preliminary annotation. They are used as evidence during annotation refinement rather than treated as a complete replacement for the protein-coding gene set.
+
+## 7. Manual curation with GSAman
+
+The annotations of **HW64, DML and CLv5.0** were all manually curated using GSAman after the computational steps above.
+
+| Genome | Preliminary annotation supplied for review | Additional transcript evidence |
+| :--- | :--- | :--- |
+| HW64 | EVM-integrated gene models | IsoQuant analysis of HiFi Kinnex reads |
+| DML | EVM-integrated gene models | IsoQuant analysis of ONT reads |
+| CLv5.0 | CLv4.0 models transferred with Liftoff | IsoQuant analysis of Iso-seq reads |
+
+Manual curation was the final gene-model refinement step. For reproducibility, retain the preliminary annotations, transcript evidence and exported curated gene sets. A record of edited gene identifiers and the supporting evidence can accompany the final annotations.
+
+GSAman curation is an interactive step; no batch command is supplied here.
+
+## Software and workflow references
+
+- [hifiasm](https://github.com/chhylp123/hifiasm) — genome assembly; version **0.25.0** in the supplied command.
+- [Cucumber pangenome annotation workflow](https://github.com/xiagjt/Cucumber.Pangenome/blob/main/Gene%20annotation.md) — initial annotation of HW64 and DML.
+- [Liftoff](https://github.com/agshumate/Liftoff) — transfer of CLv4.0 gene models to CLv5.0.
+- [IsoQuant documentation](https://ablab.github.io/IsoQuant/) — long-read transcript analysis.
+- [GSAman: A gene-structure annotation manual curator for functional genomics research](https://pubmed.ncbi.nlm.nih.gov/42891196/) — manual gene annotation curation.
+
+The HW64 assembly and IsoQuant commands and the CLv5.0 Liftoff command preserve the supplied paths and settings. DML and CLv5.0 IsoQuant commands are templates adapted from the supplied HW64 command. Apart from hifiasm, software versions were not supplied and should be recorded from the actual analysis environments.
+
+
+
