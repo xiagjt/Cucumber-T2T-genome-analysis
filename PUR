@@ -1,0 +1,144 @@
+# Candidate Previously Unresolved Genomic Regions
+
+**Identify query intervals outside selected SyRI alignments and retrieve overlapping gene annotations.**
+
+[Repository home](../README.md) · [Shell script](pipeline.sh) · [Required upstream analysis](../02_genome_alignment/README.md)
+
+## Overview
+
+This workflow extracts selected alignment-level records from `syri.out`, converts their query coordinates to BED, and computes their complement across the query assembly. It then identifies query gene records with at least 90% of their genomic span overlapping an individual complement interval.
+
+The results are called **candidate previously unresolved regions (PURs)** here for convenience. Their exact operational definition is the complement of selected, same-chromosome alignments after reference-interval deduplication. This is more specific than all query sequence lacking any reference alignment.
+
+## Requirements and inputs
+
+| Requirement | Description |
+| :--- | :--- |
+| SAMtools | Generate the FASTA index with `samtools faidx` |
+| BEDTools | Merge, complement, intersect and sort intervals |
+| Bash, awk, sort, cut, uniq | Extract and process records |
+| `syri.out` | Tabular output from module 02 |
+| Query FASTA | The exact query assembly used for SyRI |
+| Query GFF | Gene annotation on that query assembly, with `gene` feature records |
+
+For assembly improvement analyses, use **previous assembly → reference** and **T2T assembly → query**. An accession comparison can also be processed, but its complement must be interpreted as comparison-specific sequence rather than automatically as newly resolved assembly sequence.
+
+## Before running
+
+Edit the three input assignments at the top of a working copy of [pipeline.sh](pipeline.sh):
+
+```bash
+SYRI_OUT="/absolute/path/previous_vs_T2T_analysis/syri.out"
+QRY_FASTA="/absolute/path/HW64.T2T.fa"
+QRY_GFF="/absolute/path/HW64.T2T.Final.gff"
+```
+
+The original FASTA assignment contains undefined shell variables, and the GFF assignment is specific to HW64. Set explicit paths for the intended accession. Because subsequent commands do not consistently quote paths, avoid spaces in input and working-directory paths.
+
+The script retains records only when the reference chromosome name exactly equals the query chromosome name. Thus, corresponding names such as `Chr1` and `Chr01` are not interchangeable. It also excludes alignments between different chromosomes, even if SyRI labels them as translocations.
+
+## Run
+
+Use a dedicated directory because output names are fixed. From the repository root:
+
+```bash
+mkdir -p results/HW64_PURs
+cp 03_previously_unresolved_regions/pipeline.sh results/HW64_PURs/pipeline.sh
+cd results/HW64_PURs
+
+# Edit SYRI_OUT, QRY_FASTA and QRY_GFF in this working copy first.
+export LC_ALL=C
+bash pipeline.sh
+```
+
+The query FASTA directory must be writable if its `.fai` index does not already exist. Re-running in the same working directory overwrites the output files.
+
+## Selection logic
+
+### 1. Build query chromosome sizes
+
+If needed, the script creates `<query.fa>.fai`, extracts its first two columns, and sorts chromosome names. The resulting `qry.chrom.sizes` defines the coordinate space for the complement.
+
+### 2. Select alignment records
+
+The script reads reference chromosome/start/end from columns 1–3, query chromosome/start/end from columns 6–8, and annotation type from column 11 of SyRI's tabular output.
+
+| SyRI record type | Handling after the same-chromosome filter |
+| :--- | :--- |
+| `SYNAL` | Retain |
+| `INVAL` | Retain |
+| `TRANSAL` | Retain |
+| `INVTRAL` | Retain |
+| `DUPAL` | Retain only the first record for each reference chromosome/start/end key |
+| `INVDPAL` | Apply the same first-record rule, sharing keys with `DUPAL` |
+| Other types | Exclude from the aligned-interval set |
+
+Reference-interval deduplication is based on exact coordinate keys, not sequence similarity, overlap percentage or a best-alignment score. Which duplicate is retained depends on the order of records in `syri.out`. Query copies omitted by this rule can therefore appear in the complement despite having reference homology.
+
+### 3. Convert coordinates and compute the complement
+
+The query start and end are reordered when necessary. The lower coordinate is reduced by one, converting 1-based inclusive SyRI coordinates to 0-based half-open BED coordinates. Retained intervals are sorted and merged into `qry_aligned_AL_dedup.bed`.
+
+```bash
+bedtools complement \
+    -i qry_aligned_AL_dedup.bed \
+    -g qry.chrom.sizes \
+    > qry_PURs_raw_AL_dedup.bed
+```
+
+No minimum-length or assembly-gap filter is applied. The complement can include sequence with `N` bases, short intervals, divergent sequence and sequence excluded by the alignment-selection rules.
+
+### 4. Retrieve overlapping genes
+
+Only GFF rows whose feature type is `gene` are used:
+
+```bash
+awk '$3 == "gene"' "$QRY_GFF" > qry_genes_only.gff
+
+bedtools intersect \
+    -a qry_genes_only.gff \
+    -b qry_PURs_raw_AL_dedup.bed \
+    -f 0.9 -wa \
+    | bedtools sort -i - \
+    | uniq \
+    > new_genes_AL_dedup.gff
+```
+
+The 90% criterion applies to the **full gene interval**, including introns, against each individual PUR. It is not CDS coverage and does not sum overlaps across separate PURs. The output contains gene rows only; transcript, exon and CDS features are not carried through.
+
+## Outputs
+
+| File | Contents | Coordinates |
+| :--- | :--- | :--- |
+| `qry.chrom.sizes` | Query sequence names and lengths | Sequence lengths |
+| `qry_aligned_AL_dedup.bed` | Merged retained query alignments | BED: 0-based, half-open |
+| `qry_PURs_raw_AL_dedup.bed` | Complement of those alignments | BED: 0-based, half-open |
+| `qry_genes_only.gff` | All query `gene` records | GFF: 1-based, inclusive |
+| `new_genes_AL_dedup.gff` | Genes meeting the overlap threshold | GFF: 1-based, inclusive |
+
+BEDTools handles GFF/BED coordinate conventions during intersection; do not manually subtract one from the GFF before this command.
+
+## Optional summary
+
+Run after successful completion:
+
+```bash
+awk 'END {print "Candidate intervals:", NR}' qry_PURs_raw_AL_dedup.bed
+awk '{bp += $3-$2} END {print "Candidate interval span (bp):", bp+0}' \
+    qry_PURs_raw_AL_dedup.bed
+awk 'END {print "Overlapping gene records:", NR}' new_genes_AL_dedup.gff
+```
+
+These are total interval spans, not gap-excluded nucleotide counts. Gene-record counts assume the input has one `gene` row per gene.
+
+## Interpretation
+
+The historical filename `new_genes_AL_dedup.gff` means genes overlapping the selected complement, not proven new genes. Confirm sequence absence or prior assembly gaps, inspect collinearity and homologs, and assess annotation support before claiming novel genes, gene gains or genuine absence from the previous assembly.
+
+If the biological question is instead **all query bases with no accepted reference alignment**, a different analysis should include all relevant chromosome pairings and all supported duplicate-copy alignments. That would change the operational definition and should be reported separately.
+
+## Documentation
+
+- [SyRI output format](https://schneebergerlab.github.io/syri/fileformat.html)
+- [BEDTools complement](https://bedtools.readthedocs.io/en/latest/content/tools/complement.html)
+- [BEDTools intersect](https://bedtools.readthedocs.io/en/latest/content/tools/intersect.html)
