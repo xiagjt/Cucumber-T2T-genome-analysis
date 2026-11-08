@@ -1,0 +1,187 @@
+# Pore-C Mapping and Contact Map Visualization
+
+**Process Pore-C reads with C-Phasing, generate contact matrices and visualize chromosome interactions.**
+
+## Overview
+
+The supplied workflow maps Pore-C reads against a genome assembly, converts the results to pairwise contacts, generates a 10-kb Cooler matrix and plots a genome-wide heatmap. Optional commands generate a 500-kb matrix and balanced plots using C-Phasing.
+
+| Stage | Tool | Main output |
+| :--- | :--- | :--- |
+| Reference preparation | BWA, SAMtools | Reference indexes and sequence lengths |
+| Pore-C mapping | `cphasing mapper` | Pore-C alignment table |
+| Contact conversion | `cphasing porec2pairs` | Pairwise contacts with the requested quality threshold |
+| Matrix construction | `cphasing pairs2cool` | Contact matrix in `.cool` format |
+| Visualization | Custom Python script or `cphasing plot` | Genome-wide or per-chromosome heatmaps |
+
+## Requirements and inputs
+
+- BWA and SAMtools.
+- C-Phasing and its configured dependencies.
+- Python and the dependencies of the custom `plot_hic_heatmap.py` script.
+- Genome assembly in FASTA format and Pore-C reads in compressed FASTQ format.
+
+The custom plotting script was not supplied with these commands. Make it available in the working directory or replace its filename with its actual path. Its package requirements and option definitions must be documented with that script.
+
+## 1. Configure paths
+
+Run the following blocks in the same Bash session from a dedicated analysis directory:
+
+```bash
+GENOME="CLv5.T2T.fa"
+SAMPLE="CLv5"
+fq="/home/GuanJianTao/LM.Population.dir/PoreC.dir/Data.dir/BC2025051102-ONT-poreC-1samples-20250627/CG64-1/CG64-1.pass.fq.gz"
+```
+
+**Reference and biological sample:** the reference is named `CLv5.T2T.fa`, while the read path contains `CG64-1`. `SAMPLE="CLv5"` controls output naming and does not establish the biological identity of the reads. Confirm and record whether this is an intentional cross-accession mapping before interpreting the contact map.
+
+## 2. Prepare the reference
+
+```bash
+bwa index "$GENOME"
+samtools faidx "$GENOME"
+```
+
+These commands preserve the original preparation steps. The BWA index does not imply that `cphasing mapper` uses BWA; the mapper's backend depends on the installed C-Phasing version and configuration.
+
+The later commands require `CLv5.T2T.contigsizes`. If it is not already available, create it directly from the FASTA index:
+
+```bash
+cut -f1,2 "${GENOME}.fai" > CLv5.T2T.contigsizes
+```
+
+This added preparation step produces a two-column, tab-delimited sequence-name/length file. Keep names and lengths consistent with the reference used for mapping.
+
+## 3. Map Pore-C reads
+
+```bash
+cphasing mapper \
+    "$GENOME" \
+    "$fq" \
+    -o "$SAMPLE" \
+    -t 60
+```
+
+The supplied downstream commands expect the mapper result to be named `CLv5.porec.gz`. Check that this is the output produced by the installed version: the interpretation of `-o` and available output formats can vary between C-Phasing releases. Preserve the version and mapper log with the results.
+
+## 4. Generate pairwise contacts
+
+```bash
+cphasing porec2pairs \
+    CLv5.porec.gz \
+    CLv5.T2T.contigsizes \
+    -q 5 \
+    -o CLv5.pairs.gz
+```
+
+The command requests a mapping-quality threshold of `5`. Conversion represents multi-fragment Pore-C observations as pairwise contacts; pair records should not be interpreted as independent original sequencing molecules.
+
+## 5. Build a 10-kb contact matrix
+
+```bash
+cphasing pairs2cool \
+    CLv5.pairs.gz \
+    CLv5.T2T.contigsizes \
+    CLv5.10k.cool \
+    -bs 10k \
+    -t 60
+```
+
+The matrix uses 10-kb genomic bins. The output is a Cooler file suitable for downstream contact-map visualization.
+
+## 6. Plot the heatmap with the custom script
+
+```bash
+python plot_hic_heatmap.py \
+    -i CLv5.10k.cool \
+    -o CLv5.q5.10k.all_chr.png \
+    --dpi 600 \
+    --mode raw \
+    --ignore-diags 0
+```
+
+| Supplied option | Value |
+| :--- | :--- |
+| Input matrix | `CLv5.10k.cool` |
+| Output image | `CLv5.q5.10k.all_chr.png` |
+| Raster resolution | `600 dpi` |
+| Requested display mode | `raw` |
+| Diagonal-handling argument | `--ignore-diags 0` |
+
+The plotting implementation was not available for inspection. These values record the requested settings; consult the script for the exact normalization, diagonal masking, chromosome ordering and color-scale behavior.
+
+### Optional PDF output
+
+The following command was commented out in the original script:
+
+```bash
+python plot_hic_heatmap.py \
+    -i CLv5.10k.cool \
+    -o CLv5.q5.10k.all_chr.pdf \
+    --mode raw \
+    --ignore-diags 0
+```
+
+## 7. Optional C-Phasing plots
+
+These commands were also commented out in the supplied script. Run them only when these additional outputs are needed.
+
+### 7.1 Generate a 500-kb matrix
+
+```bash
+cphasing pairs2cool \
+    CLv5.pairs.gz \
+    CLv5.T2T.contigsizes \
+    CLv5.500k.cool \
+    -bs 500k \
+    -t 60
+```
+
+### 7.2 Plot a balanced genome-wide map
+
+```bash
+cphasing plot \
+    -m CLv5.500k.cool \
+    --only-chr \
+    --chr-prefix Chr \
+    --balance \
+    -o CLv5.genome_wide.png \
+    --dpi 600
+```
+
+### 7.3 Plot balanced per-chromosome maps
+
+```bash
+cphasing plot \
+    -m CLv5.10k.cool \
+    --only-chr \
+    --chr-prefix Chr \
+    --per-chromosome \
+    --balance \
+    -o CLv5.per_chr.png \
+    --dpi 600
+```
+
+These examples request matrix balancing and select chromosomes using the `Chr` prefix. Adjust the prefix to match the FASTA identifiers. Balanced plots and the custom script's requested raw-mode plot should be distinguished when reporting results.
+
+## Main output files
+
+| File | Description |
+| :--- | :--- |
+| `CLv5.T2T.fa.fai` | FASTA index |
+| `CLv5.T2T.contigsizes` | Reference sequence lengths |
+| `CLv5.porec.gz` | Expected Pore-C mapping table in the supplied workflow |
+| `CLv5.pairs.gz` | Pairwise contact records |
+| `CLv5.10k.cool` | Contact matrix at 10-kb resolution |
+| `CLv5.q5.10k.all_chr.png` | Heatmap from the custom plotting script |
+| `CLv5.500k.cool` | Optional contact matrix at 500-kb resolution |
+
+The workflow documents mapping and visualization against an existing assembly. It does not run chromosome scaffolding or haplotype phasing. Interpret contact patterns together with the actual read accession, mapping quality, coverage and independent assembly evidence.
+
+## Documentation
+
+- [C-Phasing repository](https://github.com/wangyibin/CPhasing)
+- [C-Phasing documentation](https://wangyibin.github.io/CPhasing/)
+- [Cooler documentation](https://cooler.readthedocs.io/)
+
+Commands have been formatted and checked for Bash syntax. The biological data and custom plotting script were not run during preparation of this document.
