@@ -1,0 +1,459 @@
+# Genome-Wide eQTL Analysis with EMMAX
+
+**Complete supplied workflow for genotype conversion, kinship estimation, expression transformation and parallel association testing.**
+
+## Overview
+
+Gene expression is treated as a quantitative phenotype and tested against genome-wide variants using EMMAX and a shared IBS kinship matrix. The workflow filters low-expression genes, applies a rank-based inverse normal transformation to each retained gene, runs one association scan per gene and combines the results.
+
+| Stage | Tool | Output |
+| :--- | :--- | :--- |
+| Genotype conversion | PLINK | Binary and transposed genotype files |
+| Kinship estimation | `emmax-kin-intel64` | IBS kinship matrix |
+| Phenotype preparation | Python, NumPy, pandas, SciPy | Transformed expression phenotype files |
+| Association testing | `emmax-intel64` | Per-gene association results |
+| Parallel execution | GNU Parallel or `xargs` | Concurrent scans and logs |
+| Result aggregation | Python / pandas | All associations, threshold-passing associations and lead SNPs |
+
+## 1. Requirements and inputs
+
+| Input or dependency | Description |
+| :--- | :--- |
+| `merged.rename.sort.vcf` | Uncompressed VCF with the analyzed genotype samples |
+| `eQTL.expression.xls` | Tab-delimited gene-by-sample expression matrix; first column contains gene IDs |
+| PLINK | Command-line version supporting the supplied conversion options |
+| EMMAX Intel binaries | Executables specified in the script |
+| Python 3 | Packages `numpy`, `pandas` and `scipy` |
+| GNU Parallel | Preferred parallel runner; `xargs` is the fallback |
+| Bash | Required for the embedded Python blocks and generated task commands |
+
+The expression file is plain text despite its `.xls` extension. Sample names must match genotype identifiers. The expression scale determines the meaning of the expression filter; the script does not establish whether the values are TPM, FPKM or another measure.
+
+This workflow does not perform upstream variant quality filtering, read quantification or expression library normalization. Use the appropriately prepared inputs and record their processing history.
+
+## 2. Run
+
+Save the complete Bash block below as `eQTL_pipeline.sh`, update its executable paths and run from the directory containing the input files:
+
+```bash
+bash eQTL_pipeline.sh > eQTL_pipeline.log 2>&1
+```
+
+Use a fresh output directory for a new dataset. The script generates its task list, phenotype files and results beneath `eQTL_Results_all/`.
+
+## 3. Complete supplied script
+
+The code below preserves the supplied implementation, including its filtering threshold, output format assumptions, resume behavior and original comments. It is accompanied by implementation notes rather than presented as a corrected replacement.
+
+```bash
+#!/bin/bash
+# eQTL_pipeline.sh
+# 完整eQTL分析流程：建库 → 亲缘矩阵 → 表型过滤+矫正 → 并行EMMAX → 合并结果
+
+set -euo pipefail
+
+# ── 路径配置 ──────────────────────────────────────────────────────
+VCF="merged.rename.sort.vcf"
+EXPR="eQTL.expression.xls"
+EMMAX_KIN="/bioinfo/guanjt/Genome.CG104.dir/eQTL/QTL.dir/Emmax.Software/emmax-kin-intel64"
+EMMAX="/bioinfo/guanjt/Genome.CG104.dir/eQTL/QTL.dir/Emmax.Software/emmax-intel64"
+PLINK="plink"
+
+# 并行参数
+THREADS=20
+
+# 过滤参数
+MIN_EXPR=1
+MIN_SAMPLE_PCT=0.2
+
+# 输出目录
+OUTDIR="eQTL_Results_all"
+KINDIR="${OUTDIR}/Kinship"
+PHENODIR="${OUTDIR}/Phenos"
+RESDIR="${OUTDIR}/Results"
+LOGDIR="${OUTDIR}/Logs"
+
+mkdir -p "${KINDIR}" "${PHENODIR}" "${RESDIR}" "${LOGDIR}"
+
+echo "========================================"
+echo "  eQTL 分析流程"
+echo "========================================"
+echo "VCF      : ${VCF}"
+echo "表达矩阵 : ${EXPR}"
+echo "并行数   : ${THREADS}"
+echo ""
+
+# ════════════════════════════════════════════════════════════════
+# Step 1: plink 建库
+# ════════════════════════════════════════════════════════════════
+echo "[Step 1] plink 建库..."
+
+PLINK_PREFIX="${KINDIR}/eQTL_geno"
+
+${PLINK} \
+    --vcf "${VCF}" \
+    --make-bed \
+    --allow-extra-chr \
+    --recode transpose 12 \
+    --out "${PLINK_PREFIX}" \
+    --silent
+
+echo "  plink建库完成: ${PLINK_PREFIX}.tped/.tfam"
+
+# ════════════════════════════════════════════════════════════════
+# Step 2: 计算亲缘矩阵
+# ════════════════════════════════════════════════════════════════
+echo ""
+echo "[Step 2] 计算亲缘矩阵 (emmax-kin)..."
+
+cd "${KINDIR}"
+${EMMAX_KIN} -v -s -d 10 eQTL_geno
+cd - > /dev/null
+
+KINSHIP="${KINDIR}/eQTL_geno.aIBS.kinf"
+if [ ! -f "${KINSHIP}" ]; then
+    echo "[ERROR] 亲缘矩阵未生成: ${KINSHIP}"
+    exit 1
+fi
+echo "  亲缘矩阵完成: ${KINSHIP}"
+
+# ════════════════════════════════════════════════════════════════
+# Step 3: 表型过滤 + qqnorm矫正 + 生成表型文件
+# ════════════════════════════════════════════════════════════════
+echo ""
+echo "[Step 3] 表型过滤和qqnorm矫正..."
+
+python3 << PYEOF
+import os
+import math
+import numpy as np
+import pandas as pd
+from scipy import stats
+
+expr_file   = "${EXPR}"
+pheno_dir   = "${PHENODIR}"
+vcf_file    = "${VCF}"
+tfam_file   = "${KINDIR}/eQTL_geno.tfam"
+gene_list_f = "${OUTDIR}/gene_list.txt"
+min_expr    = float(${MIN_EXPR})
+min_pct     = float(${MIN_SAMPLE_PCT})
+
+# ── 读取VCF样品顺序 ──────────────────────────────────────────────
+vcf_samples = []
+with open(vcf_file) as fh:
+    for line in fh:
+        if line.startswith("#CHROM"):
+            vcf_samples = line.rstrip("\n").split("\t")[9:]
+            break
+print(f"  VCF样品数: {len(vcf_samples)}")
+
+# ── 读取表达矩阵 ─────────────────────────────────────────────────
+expr = pd.read_csv(expr_file, sep="\t", index_col=0)
+print(f"  表达矩阵: {expr.shape[0]} 基因 × {expr.shape[1]} 样品")
+
+# 只保留VCF中有的样品，顺序与VCF一致
+common = [s for s in vcf_samples if s in expr.columns]
+missing_in_expr = [s for s in vcf_samples if s not in expr.columns]
+print(f"  VCF与表达矩阵共有样品: {len(common)}")
+if missing_in_expr:
+    print(f"  [WARN] 以下样品不在表达矩阵中: "
+          f"{missing_in_expr[:5]}"
+          f"{'...' if len(missing_in_expr) > 5 else ''}")
+
+expr = expr[common]
+
+# ── 读取TFAM获取FID/IID ──────────────────────────────────────────
+tfam_map = {}
+with open(tfam_file) as fh:
+    for line in fh:
+        parts = line.strip().split()
+        if parts:
+            tfam_map[parts[1]] = (parts[0], parts[1])  # IID → (FID,IID)
+print(f"  TFAM样品数: {len(tfam_map)}")
+
+# ── 表型过滤 ─────────────────────────────────────────────────────
+n_total  = expr.shape[0]
+min_samp = math.ceil(len(common) * min_pct)
+expr_pass = expr[(expr > min_expr).sum(axis=1) >= min_samp]
+n_pass    = expr_pass.shape[0]
+print(f"  表型过滤: {n_total} → {n_pass} 基因")
+print(f"  过滤条件: ≥{min_samp}个样品({min_pct*100:.0f}%)"
+      f" 表达量>{min_expr}")
+print(f"  过滤掉:   {n_total - n_pass} 基因")
+
+# ── qqnorm矫正 ───────────────────────────────────────────────────
+def qqnorm(x):
+    x     = np.array(x, dtype=float)
+    valid = ~np.isnan(x)
+    n     = valid.sum()
+    if n < 3:
+        return x
+    ranks         = stats.rankdata(x[valid])
+    quantiles     = stats.norm.ppf((ranks - 0.5) / n)
+    result        = x.copy()
+    result[valid] = quantiles
+    return result
+
+expr_norm = expr_pass.apply(qqnorm, axis=1, result_type="expand")
+expr_norm.columns = expr_pass.columns
+print(f"  qqnorm矫正完成")
+
+# ── 生成表型文件 ─────────────────────────────────────────────────
+gene_list = []
+for gene_id in expr_norm.index:
+    pheno_file = os.path.join(pheno_dir, f"{gene_id}.txt")
+    values     = expr_norm.loc[gene_id]
+    with open(pheno_file, "w") as fh:
+        for sample in common:
+            fid, iid = tfam_map.get(sample, (sample, sample))
+            val      = values[sample]
+            if np.isnan(val):
+                fh.write(f"{fid}\t{iid}\tNA\n")
+            else:
+                fh.write(f"{fid}\t{iid}\t{val:.6f}\n")
+    gene_list.append(gene_id)
+
+with open(gene_list_f, "w") as fh:
+    for g in gene_list:
+        fh.write(g + "\n")
+
+print(f"  表型文件已生成: {len(gene_list)} 个")
+print(f"  基因列表: {gene_list_f}")
+PYEOF
+
+echo "  表型准备完成"
+N_GENES=$(wc -l < "${OUTDIR}/gene_list.txt")
+echo "  待分析基因数: ${N_GENES}"
+
+# ════════════════════════════════════════════════════════════════
+# Step 4: 生成EMMAX任务列表
+# ════════════════════════════════════════════════════════════════
+echo ""
+echo "[Step 4] 生成EMMAX任务列表..."
+
+TPED_PREFIX="${KINDIR}/eQTL_geno"
+TASK_FILE="${OUTDIR}/emmax_tasks.sh"
+
+> "${TASK_FILE}"
+
+while IFS= read -r gene; do
+    pheno="${PHENODIR}/${gene}.txt"
+    outpfx="${RESDIR}/${gene}"
+    echo "${EMMAX} -v -d 10 \
+-t ${TPED_PREFIX} \
+-p ${pheno} \
+-k ${KINSHIP} \
+-o ${outpfx} \
+> ${LOGDIR}/${gene}.log 2>&1" >> "${TASK_FILE}"
+done < "${OUTDIR}/gene_list.txt"
+
+echo "  任务列表: ${TASK_FILE}"
+echo "  总任务数: $(wc -l < ${TASK_FILE})"
+
+# ════════════════════════════════════════════════════════════════
+# Step 5: 并行运行EMMAX
+# ════════════════════════════════════════════════════════════════
+echo ""
+echo "[Step 5] 并行运行EMMAX (${THREADS} 并发)..."
+echo "  开始时间: $(date)"
+
+if command -v parallel &> /dev/null; then
+    echo "  使用 GNU parallel"
+    parallel \
+        --jobs ${THREADS} \
+        --bar \
+        --joblog "${OUTDIR}/parallel.log" \
+        --resume \
+        < "${TASK_FILE}"
+else
+    echo "  使用 xargs 并行"
+    cat "${TASK_FILE}" | \
+        xargs -P ${THREADS} -I {} bash -c '{}'
+fi
+
+echo "  结束时间: $(date)"
+
+# ════════════════════════════════════════════════════════════════
+# Step 6: 检查完成情况
+# ════════════════════════════════════════════════════════════════
+echo ""
+echo "[Step 6] 检查运行结果..."
+
+N_DONE=$(ls "${RESDIR}"/*.ps 2>/dev/null | wc -l)
+N_FAILED=$((N_GENES - N_DONE))
+echo "  期望完成: ${N_GENES}"
+echo "  实际完成: ${N_DONE}"
+echo "  未完成:   ${N_FAILED}"
+
+if [ ${N_FAILED} -gt 0 ]; then
+    echo ""
+    echo "  [WARN] 生成重跑脚本..."
+    RETRY_FILE="${OUTDIR}/emmax_retry.sh"
+    > "${RETRY_FILE}"
+    while IFS= read -r gene; do
+        if [ ! -f "${RESDIR}/${gene}.ps" ]; then
+            pheno="${PHENODIR}/${gene}.txt"
+            outpfx="${RESDIR}/${gene}"
+            echo "${EMMAX} -v -d 10 \
+-t ${TPED_PREFIX} \
+-p ${pheno} \
+-k ${KINSHIP} \
+-o ${outpfx} \
+> ${LOGDIR}/${gene}.log 2>&1" >> "${RETRY_FILE}"
+        fi
+    done < "${OUTDIR}/gene_list.txt"
+    echo "  重跑脚本: ${RETRY_FILE}"
+    echo "  运行重跑: bash ${RETRY_FILE}"
+fi
+
+# ════════════════════════════════════════════════════════════════
+# Step 7: 合并结果
+# ════════════════════════════════════════════════════════════════
+echo ""
+echo "[Step 7] 合并EMMAX结果..."
+
+python3 << PYEOF
+import os
+import glob
+import pandas as pd
+
+res_dir   = "${RESDIR}"
+out_file  = "${OUTDIR}/eQTL_all_results.tsv"
+sig_file  = "${OUTDIR}/eQTL_significant.tsv"
+lead_file = "${OUTDIR}/eQTL_lead_SNPs.tsv"
+
+ps_files = sorted(glob.glob(os.path.join(res_dir, "*.ps")))
+print(f"  找到结果文件: {len(ps_files)} 个")
+
+if not ps_files:
+    print("  [WARN] 未找到.ps文件，跳过合并")
+    exit(0)
+
+all_rows = []
+for ps_file in ps_files:
+    gene = os.path.basename(ps_file).replace(".ps", "")
+    try:
+        df = pd.read_csv(ps_file, sep="\t", header=None,
+                         names=["SNP","Beta","SE","Pval"])
+        df.insert(0, "Gene", gene)
+        all_rows.append(df)
+    except Exception as e:
+        print(f"  [WARN] 读取 {ps_file} 失败: {e}")
+
+if not all_rows:
+    print("  [WARN] 无有效结果")
+    exit(0)
+
+result_df = pd.concat(all_rows, ignore_index=True)
+
+n_genes = result_df["Gene"].nunique()
+n_snps  = result_df["SNP"].nunique()
+n_tests = len(result_df)
+
+# 显著性阈值：1 / n_SNPs
+bonf_thr = 1.0 / n_snps
+
+print(f"  基因数:     {n_genes:,}")
+print(f"  SNP数:      {n_snps:,}")
+print(f"  总关联数:   {n_tests:,}")
+print(f"  显著性阈值: 1/{n_snps:,} = {bonf_thr:.2e}")
+
+result_df.to_csv(out_file, sep="\t", index=False)
+print(f"  全部结果已写入: {out_file}")
+
+# 显著结果
+sig_df = result_df[result_df["Pval"] < bonf_thr]
+sig_df = sig_df.sort_values("Pval")
+sig_df.to_csv(sig_file, sep="\t", index=False)
+print(f"  显著结果 (P < 1/{n_snps:,} = {bonf_thr:.2e}): "
+      f"{len(sig_df):,} 个")
+
+if len(sig_df) > 0:
+    # 按基因统计显著eQTL数
+    gene_sig = (sig_df.groupby("Gene")["SNP"]
+                .count().reset_index()
+                .rename(columns={"SNP": "n_sig_SNP"})
+                .sort_values("n_sig_SNP", ascending=False))
+    print(f"  含显著eQTL的基因数: {len(gene_sig):,}")
+    print(f"\n  Top 10 eQTL基因:")
+    print(gene_sig.head(10).to_string(index=False))
+
+    # 每个基因的lead SNP
+    lead_snp = (sig_df.sort_values("Pval")
+                .groupby("Gene")
+                .first()
+                .reset_index()
+                [["Gene","SNP","Beta","SE","Pval"]]
+                .rename(columns={"SNP" : "lead_SNP",
+                                  "Pval": "lead_Pval"}))
+    lead_snp.to_csv(lead_file, sep="\t", index=False)
+    print(f"  Lead SNP文件: {lead_file}")
+else:
+    print("  未检测到显著eQTL")
+PYEOF
+
+echo ""
+echo "========================================"
+echo "  eQTL 分析流程完成"
+echo "  结果目录: ${OUTDIR}/"
+echo "    全部结果: eQTL_all_results.tsv"
+echo "    显著结果: eQTL_significant.tsv"
+echo "    Lead SNP: eQTL_lead_SNPs.tsv"
+echo "========================================"
+```
+
+## 4. Settings and interpretation
+
+| Setting | Supplied value | Meaning |
+| :--- | :--- | :--- |
+| `THREADS` | `20` | Concurrent gene-level jobs; not a per-job thread argument |
+| `MIN_EXPR` | `1` | Expression must be strictly greater than 1 to count as expressed |
+| `MIN_SAMPLE_PCT` | `0.2` | Require expression above threshold in at least `ceil(0.2 × common samples)` |
+| Kinship | `-s` / `.aIBS.kinf` | IBS matrix shared across gene scans |
+| Transformation | Rank-based inverse normal | Applied separately within each gene |
+| Explicit covariates | None | No `-c` file or separate expression covariate regression is supplied |
+| Association threshold | `P < 1 / n_snps` | Original threshold, based on distinct SNP identifiers in merged results |
+
+For a gene with `n` nonmissing expression values, transformed values are `Φ⁻¹((rank − 0.5) / n)`, with average ranks for ties. Genes with fewer than three nonmissing values are left untransformed by this function. This transformation is not batch correction or hidden-factor correction.
+
+The variable name `bonf_thr` is retained from the source, but **`1 / n_snps` is not a 5% Bonferroni threshold**. A marker-wise Bonferroni threshold at α = 0.05 would be `0.05 / n_snps`; correcting across all gene–variant tests would require defining that larger testing family. Neither alternative nor FDR control is implemented here.
+
+The lead file selects one lowest-P SNP per gene among threshold-passing associations. It does not identify independent signals, perform conditional mapping or classify cis/trans associations. The per-gene count of significant SNPs likewise counts associated markers rather than independent eQTL loci.
+
+## 5. Outputs
+
+All paths below are relative to `eQTL_Results_all/`.
+
+| File or directory | Contents |
+| :--- | :--- |
+| `Kinship/eQTL_geno.*` | Converted genotypes and reference sample identifiers |
+| `Kinship/eQTL_geno.aIBS.kinf` | Kinship matrix |
+| `Phenos/<gene>.txt` | Header-free `FID`, `IID`, expression-phenotype columns |
+| `gene_list.txt` | Genes retained for association testing |
+| `emmax_tasks.sh` | Generated scan commands |
+| `Results/<gene>.ps` | Per-gene SNP association results |
+| `Results/<gene>.reml` | EMMAX variance-component output where produced |
+| `Logs/<gene>.log` | Per-gene execution log |
+| `parallel.log` | GNU Parallel job log, when that runner is used |
+| `emmax_retry.sh` | Commands for genes lacking `.ps` files, when the check is reached and detects missing results |
+| `eQTL_all_results.tsv` | Combined `Gene`, `SNP`, `Beta`, `SE`, `Pval` columns |
+| `eQTL_significant.tsv` | Associations passing the supplied threshold |
+| `eQTL_lead_SNPs.tsv` | One lead association per significant gene; written only when such associations exist |
+
+The four-column `.ps` reader matches the Intel EMMAX output documented by the developer. Verify the actual executable's output before merging; older distributions can use a different column layout. Beta is on the transformed-expression scale and its sign depends on genotype allele encoding.
+
+## 6. Implementation details to check before reuse
+
+- **Sample alignment:** EMMAX requires phenotype rows in the same order as TFAM. This script writes rows in VCF intersection order and uses TFAM only as an ID lookup. Verify exact order and membership, or revise preparation to iterate over every TFAM row and encode missing expression as `NA`. Simply omitting genotype samples without expression does not align the phenotype with the full kinship matrix.
+- **Input validity:** the script expects an uncompressed VCF readable with Python `open()`, numeric expression values, unique gene/sample IDs and suitable SNP identifiers. It does not explicitly reject zero shared samples, constant expression or invalid numeric values. Gene IDs are used as filenames and unquoted task arguments, so their characters must be compatible with those uses.
+- **Completion and retries:** a `.ps` filename is counted as completion without checking its contents. With `set -euo pipefail`, a parallel-run failure can stop execution before the retry block; if no `.ps` files exist, the `ls` pipeline can also stop it. Inspect exit statuses and logs rather than relying solely on the printed count.
+- **Reruns:** GNU Parallel uses an existing job log with `--resume`. Keep task ordering and inputs unchanged for a resume. Old result files are merged via a directory-wide `*.ps` glob, including files that may no longer belong to the current gene list.
+- **Aggregation size:** all gene–SNP results are loaded into memory before concatenation. Estimate the full scan size before using this implementation for a large expression panel.
+
+## References and validation
+
+- [EMMAX developer documentation](https://genome.sph.umich.edu/wiki/EMMAX)
+- [PLINK documentation](https://www.cog-genomics.org/plink/1.9/)
+- [GNU Parallel](https://www.gnu.org/software/parallel/)
+
+The embedded Bash script and Python syntax were checked without running the analysis. No genotype, expression or EMMAX result files were available for a biological validation run.
